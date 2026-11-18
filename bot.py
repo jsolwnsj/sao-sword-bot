@@ -12,6 +12,11 @@
   (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و اگر باز هم فایل بالای ۵۰ مگ بود،
   با ffmpeg آن را به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند و قسمت‌ها را
   به ترتیب می‌فرستد.
+- راه دوم برای فایل بزرگ (اختیاری): MTProto با Telethon. اگر متغیرهای
+  TELETHON_API_ID و TELETHON_API_HASH و TELETHON_SESSION_STRING
+  ست شده باشند، فایل بزرگ (تا ۲ گیگابایت) مستقیم با حساب کاربری
+  تلگرام فرستاده می‌شود و نیازی به تیکه‌تیکه کردن نیست. اگر این
+  متغیرها نباشند، همان مسیر پایین آوردن کیفیت + تقسیم استفاده می‌شود.
 - توکن از متغیر محیطی BOT_TOKEN خوانده می‌شود؛ هیچ‌وقت اینجا هاردکد نکن.
 - روش اجرا: polling — نیازی به دامین و وب‌هوک نیست.
 """
@@ -35,6 +40,18 @@ from telegram.ext import (
     filters,
 )
 
+# Telethon به‌صورت lazy وارد می‌شود تا اگر نصب نبود، ربات باز هم
+# با مسیر معمولی Bot API کار کند. اگر telethon نصب باشد و متغیرهای
+# محیطی‌اش ست شده باشند، مسیر MTProto فعال می‌شود.
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except ImportError:  # pragma: no cover - telethon not installed
+    TelegramClient = None  # type: ignore[assignment]
+    StringSession = None  # type: ignore[assignment]
+    TELETHON_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # تنظیمات
 # ---------------------------------------------------------------------------
@@ -48,6 +65,75 @@ logger = logging.getLogger("downloader-bot")
 # سقف سخت تلگرام برای ارسال فایل با ربات: ۵۰ مگابایت.
 # با کمی حاشیه امن، ۴۸ مگابایت می‌گیریم.
 MAX_BYTES = 48 * 1024 * 1024
+
+# سقف ارسال فایل با MTProto (حساب کاربری Telethon): ۲ گیگابایت.
+TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def telethon_configured() -> bool:
+    """True اگر هر سه متغیر Telethon ست شده باشند و کتابخانه نصب باشد."""
+    if not TELETHON_AVAILABLE:
+        return False
+    api_id = os.environ.get("TELETHON_API_ID", "").strip()
+    api_hash = os.environ.get("TELETHON_API_HASH", "").strip()
+    session = os.environ.get("TELETHON_SESSION_STRING", "").strip()
+    if not api_id or not api_hash or not session:
+        return False
+    try:
+        int(api_id)
+    except ValueError:
+        return False
+    return True
+
+
+async def send_via_telethon(chat_id: int, path: Path, caption: str | None) -> bool:
+    """
+    فایل را با MTProto (حساب کاربری Telethon) به همان چت می‌فرستد.
+    سقف ۲ گیگابایت است و سقف ۵۰ مگ Bot API را ندارد.
+    در صورت هر خطایی False برمی‌گرداند تا مسیر تقسیم استفاده شود.
+    نکته: حساب کاربری Telethon باید عضو گروه باشد (برای ارسال به گروه)
+    یا با گیرنده دیالوگ داشته باشد (برای پی‌وی)؛ در غیر این صورت
+    ارسال ناموفق می‌شود و False برمی‌گردد.
+    """
+    if not telethon_configured():
+        return False
+    try:
+        api_id = int(os.environ["TELETHON_API_ID"].strip())
+        api_hash = os.environ["TELETHON_API_HASH"].strip()
+        session_str = os.environ["TELETHON_SESSION_STRING"].strip()
+    except (KeyError, ValueError):
+        return False
+
+    client = None
+    try:
+        client = TelegramClient(
+            StringSession(session_str), api_id, api_hash
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.warning("Telethon session is not authorized.")
+            return False
+        await client.send_file(
+            chat_id,
+            str(path),
+            caption=caption,
+            supports_streaming=True,
+        )
+        logger.info(
+            "Sent %s (%d bytes) via Telethon MTProto to %s",
+            path, path.stat().st_size, chat_id,
+        )
+        return True
+    except Exception:
+        logger.exception("Telethon send failed for %s", path)
+        return False
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
@@ -65,7 +151,7 @@ START_TEXT = """سلام! 👋
 نکته‌ها:
 • فقط محتوای عمومی دانلود می‌شه؛ محتوای خصوصی و نیازمند لاگین، توی این نسخه نیست.
 • یوتیوب توی این نسخه نیست.
-• تلگرام سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات داره و با «مستقیم فرستادن» دور زده نمی‌شه. من اول کیفیت رو پایین می‌آرم (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و اگه باز هم ویدیو بزرگ بود، تیکه‌تیکه‌ش می‌کنم و قسمت‌ها رو به ترتیب می‌فرستم. پس ویدیوهای خیلی طولانی ممکنه چند قسمت بشن.
+• تلگرام سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات داره و با «مستقیم فرستادن» دور زده نمی‌شه. من اول کیفیت رو پایین می‌آرم (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p). اگه فایل باز هم بزرگ بود، اگه ارسال با MTProto (Telethon) فعال باشه، مستقیم تا ۲ گیگابایت فرستاده می‌شه؛ اگه فعال نباشه، تیکه‌تیکه‌ش می‌کنم و قسمت‌ها رو به ترتیب می‌فرستم. پس ویدیوهای خیلی طولانی ممکنه چند قسمت بشن.
 • توی گروه هم کار می‌کنم، فقط باید Privacy Mode ربات خاموش باشه (تو BotFather با /setprivacy).
 
 دستورها:
@@ -84,6 +170,15 @@ ERROR_TEXT = (
     "لینک رو چک کن که عمومی باشه و دوباره بفرست."
     "\nاگه باز هم نشد، شاید اینستا یا پورن‌هاب موقتاً جلوش رو گرفته."
 )
+
+
+def help_text() -> str:
+    """متن راهنما + وضعیت مسیر MTProto (فعال/غیرفعال)."""
+    if telethon_configured():
+        status = "\nارسال فایل بزرگ (MTProto) فعال است؛ ویدیوهای بزرگ تا ۲ گیگابایت مستقیم فرستاده می‌شوند."
+    else:
+        status = "\nارسال فایل بزرگ (MTProto) فعال نیست؛ ویدیوهای بزرگ تیکه‌تیکه می‌شوند."
+    return START_TEXT + status
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +313,19 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
     return [p for p in parts if p.is_file() and p.stat().st_size > 0] or [path]
 
 
-async def download_best_effort(url: str, tmpdir: str):
+async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = False):
     """
     دانلود با پایین آوردن کیفیت (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و در صورت نیاز
     تقسیم به قسمت‌ها.
     برمی‌گرداند: (title, files, was_split)
+
+    اگر prefer_telethon=True باشد (یعنی MTProto فعال است)، به‌جای تقسیم،
+    فایل باکیفیت‌ترین دانلود (۷۲۰p) برگردانده می‌شود تا فرستنده اول
+    Telethon را امتحان کند؛ تقسیم فقط وقتی انجام می‌شود که Telethon
+    نباشد یا ناموفق باشد (فرستنده خودش آن را انجام می‌دهد).
     """
     best_candidate: tuple[str, list[Path]] | None = None
+    results: dict[int, tuple[str, list[Path]]] = {}
 
     for height in (720, 480, 360):
         subdir = Path(tmpdir) / f"h{height}"
@@ -238,6 +339,8 @@ async def download_best_effort(url: str, tmpdir: str):
             continue
         if not files:
             continue
+
+        results[height] = (title, files)
 
         # فایل اصلی: بزرگ‌ترین فایل دانلودشده.
         main = max(files, key=lambda p: p.stat().st_size)
@@ -254,6 +357,15 @@ async def download_best_effort(url: str, tmpdir: str):
         return "", [], False
 
     title, files = best_candidate
+
+    # مسیر MTProto: فایل باکیفیت (۷۲۰p) را بدون تقسیم برگردان؛
+    # فرستنده اول Telethon را امتحان می‌کند.
+    if prefer_telethon:
+        if 720 in results:
+            hq_title, hq_files = results[720]
+            return hq_title, hq_files, False
+        return title, files, False
+
     main = max(files, key=lambda p: p.stat().st_size)
 
     # اگر فایل اصلی ویدیو نیست (مثلاً عکس)، تقسیم معنا ندارد.
@@ -325,14 +437,23 @@ async def send_files(bot, chat_id: int, title: str, files: list[Path],
 async def do_download_and_send(bot, chat_id: int, url: str) -> str:
     """
     دانلود و ارسال. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    ترتیب ارسال:
+    ۱) فایل زیر ۴۸ مگ: مستقیم با Bot API.
+    ۲) فایل بزرگ‌تر: اگر MTProto (Telethon) فعال باشد، مستقیم تا ۲ گیگ
+       با حساب کاربری فرستاده می‌شود.
+    ۳) اگر Telethon نباشد یا ناموفق باشد: تقسیم به قسمت‌های زیر ۴۸ مگ
+       و ارسال قسمت‌ها با Bot API.
     """
+    use_telethon = telethon_configured()
     status = await bot.send_message(
         chat_id=chat_id, text="⏳ دارم دانلود می‌کنم، یه کم صبر کن..."
     )
     try:
         with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
             try:
-                title, files, was_split = await download_best_effort(url, tmpdir)
+                title, files, was_split = await download_best_effort(
+                    url, tmpdir, prefer_telethon=use_telethon
+                )
             except Exception:
                 logger.exception("download failed for %s", url)
                 return "error"
@@ -340,12 +461,50 @@ async def do_download_and_send(bot, chat_id: int, url: str) -> str:
             if not files:
                 return "empty"
 
+            # فایل‌های کوچک و بزرگ را جدا کن.
+            small = [p for p in files if p.stat().st_size <= MAX_BYTES]
+            large = [p for p in files if p.stat().st_size > MAX_BYTES]
+
+            # ۱) فایل‌های کوچک: مستقیم با Bot API.
+            sent = False
+            if small:
+                sent = await send_files(bot, chat_id, title, small, was_split)
+
+            # ۲) فایل‌های بزرگ: اول MTProto، بعد تقسیم.
+            for path in large:
+                if path.stat().st_size > TELETHON_MAX_BYTES:
+                    continue
+                if use_telethon:
+                    caption = title[:200] if title else None
+                    if await send_via_telethon(chat_id, path, caption):
+                        sent = True
+                        continue
+                    logger.warning(
+                        "Telethon send failed for %s; falling back to split",
+                        path,
+                    )
+                # ۳) تقسیم به قسمت‌ها و ارسال با Bot API.
+                if path.suffix.lower() in VIDEO_EXTS:
+                    parts_dir = Path(tmpdir) / f"parts-{path.stem}"
+                    parts = await asyncio.to_thread(
+                        _split_video_sync, path, parts_dir
+                    )
+                    if len(parts) > 1 and all(
+                        p.stat().st_size <= MAX_BYTES for p in parts
+                    ):
+                        if await send_files(
+                            bot, chat_id, title, parts, True
+                        ):
+                            sent = True
+                        continue
+                # نه Telethon شد، نه تقسیم؛ این فایل فرستاده نشد.
+
+            if sent:
+                return "ok"
             # اگر حتی یک فایل هم زیر سقف نبود (و تقسیم هم نشد)، too_big
             if all(p.stat().st_size > MAX_BYTES for p in files):
                 return "too_big"
-
-            sent = await send_files(bot, chat_id, title, files, was_split)
-            return "ok" if sent else "empty"
+            return "empty"
     finally:
         try:
             await status.delete()
@@ -358,11 +517,11 @@ async def do_download_and_send(bot, chat_id: int, url: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_TEXT)
+    await update.message.reply_text(help_text())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_TEXT)
+    await update.message.reply_text(help_text())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
