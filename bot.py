@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-دانلودر تلگرام — اینستاگرام + پورن‌هاب (یوتیوب ندارد).
+دانلودر تلگرام — اینستاگرام + تیک‌تاک + یوتیوب + پورن‌هاب + ساندکلود.
 - پی‌وی و گروه.
-- اینستا: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
-- پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
+- اینستا و تیک‌تاک: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
+- یوتیوب و پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
   پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
+  یوتیوب یک گزینه «صوتی (mp3)» هم دارد.
+- ساندکلود: اول کاور آهنگ با اسم آهنگ و خواننده، بعد فایل صوتی
+  mp3 با عنوان و خواننده درست.
 - فایل بزرگ: اول با کیفیت پایین‌تر مستقیم دانلود می‌شود
   (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p). اگر فایل باز هم بالای ۴۸ مگ بود،
   **خود ربات** با Telethon bot client (MTProto با BOT_TOKEN،
@@ -453,7 +456,10 @@ def bot_telethon_available() -> bool:
 
 async def send_via_telethon_bot(chat_id: int, path: Path, caption: str | None,
                                 thumb: str | None = None,
-                                tracker: ProgressTracker | None = None) -> bool:
+                                tracker: ProgressTracker | None = None,
+                                audio_title: str | None = None,
+                                audio_performer: str | None = None,
+                                audio_duration: int | None = None) -> bool:
     """
     فایل را با MTProto **به‌عنوان خود ربات** می‌فرستد — نه حساب
     کاربری. کلاینت Telethon با BOT_TOKEN وارد می‌شود
@@ -466,6 +472,8 @@ async def send_via_telethon_bot(chat_id: int, path: Path, caption: str | None,
     در صورت هر خطایی False برمی‌گرداند تا مسیر بعدی امتحان شود.
     نکته: ربات باید عضو گروه باشد (برای ارسال به گروه) یا کاربر
     ربات را استارت کرده باشد (برای پی‌وی).
+    برای فایل صوتی (mp3) می‌توان عنوان، خواننده و مدت را هم داد
+    تا توی تلگرام درست نمایش داده شود.
     """
     creds = _bot_telethon_credentials()
     if creds is None:
@@ -484,6 +492,20 @@ async def send_via_telethon_bot(chat_id: int, path: Path, caption: str | None,
         kwargs = {"supports_streaming": True}
         if thumb:
             kwargs["thumb"] = thumb
+        # فایل صوتی: عنوان و خواننده را توی متادیتای فایل می‌گذاریم
+        # تا تلگرام آن را مثل آهنگ نشان بدهد، نه فایل معمولی.
+        if path.suffix.lower() == ".mp3" and audio_title:
+            try:
+                from telethon.tl.types import DocumentAttributeAudio
+                kwargs["attributes"] = [
+                    DocumentAttributeAudio(
+                        duration=int(audio_duration or 0),
+                        title=audio_title,
+                        performer=audio_performer or "",
+                    )
+                ]
+            except Exception:
+                pass
         if tracker is not None:
             tracker.begin_upload(1, path.stat().st_size)
 
@@ -519,11 +541,15 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
 START_TEXT = """سلام! 👋
-لینک اینستاگرام یا پورن‌هاب رو بفرست تا دانلودش کنم.
-برای پورن‌هاب، بعد از فرستادن لینک کیفیت رو انتخاب می‌کنی.
+لینک بفرست تا دانلودش کنم:
+📸 اینستاگرام و تیک‌تاک
+🎬 یوتیوب و پورن‌هاب — کیفیت رو انتخاب می‌کنی
+🎵 ساندکلود
 /makesession — فقط پی‌وی"""
 
 TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
+
+AGE_RESTRICTED_TEXT = "این ویدیو محدودیت سنی یا منطقه‌ای داره. 😕"
 
 ERROR_TEXT = "نشد دانلودش کنم. 😕"
 
@@ -532,12 +558,12 @@ def help_text() -> str:
     return START_TEXT
 
 
-# یوزرنیم ربات (برای کپشن اینستا)؛ یک بار گرفته و کش می‌شود.
+# یوزرنیم ربات (برای کپشن اینستا و تیک‌تاک)؛ یک بار گرفته و کش می‌شود.
 _BOT_USERNAME: str | None = None
 
 
 async def instagram_caption(bot) -> str:
-    """کپشن ویدیوهای اینستا: فقط آیدی ربات + قلب."""
+    """کپشن ویدیوهای اینستا و تیک‌تاک: فقط آیدی ربات + قلب."""
     global _BOT_USERNAME
     if _BOT_USERNAME is None:
         username = getattr(bot, "username", None)
@@ -574,7 +600,29 @@ def detect_platform(url: str) -> str | None:
         return "instagram"
     if "pornhub.com" in low:
         return "pornhub"
+    if "tiktok.com" in low:
+        return "tiktok"
+    if "youtube.com" in low or "youtu.be" in low:
+        return "youtube"
+    if "soundcloud.com" in low:
+        return "soundcloud"
     return None
+
+
+# Referer هر پلتفرم برای هدرهای yt-dlp و HEAD.
+_PLATFORM_REFERERS = {
+    "pornhub": "https://www.pornhub.com/",
+    "instagram": "https://www.instagram.com/",
+    "tiktok": "https://www.tiktok.com/",
+    "youtube": "https://www.youtube.com/",
+    "soundcloud": "https://soundcloud.com/",
+}
+
+
+def _referer_for(url: str) -> str:
+    return _PLATFORM_REFERERS.get(
+        detect_platform(url) or "", "https://www.google.com/"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -673,28 +721,32 @@ def get_instagram_cookiefile() -> str | None:
     return None
 
 
-def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
-    """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای."""
+def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None,
+                    audio_only: bool = False,
+                    noplaylist: bool = True) -> dict:
+    """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای.
+    audio_only=True یعنی فقط بهترین صدا و تبدیل به mp3 (یوتیوب
+    صوتی و ساندکلود). noplaylist=False فقط برای اسلایدشوی
+    عکس‌های تیک‌تاک استفاده می‌شود."""
     global _IMPERSONATION_WARNING_LOGGED
     platform = detect_platform(url)
-    if platform == "pornhub":
-        referer = "https://www.pornhub.com/"
-    elif platform == "instagram":
-        referer = "https://www.instagram.com/"
-    else:
-        referer = "https://www.google.com/"
+    referer = _referer_for(url)
 
-    ydl_opts: dict = {
-        "format": (
+    if audio_only:
+        fmt = "bestaudio/best"
+    else:
+        fmt = (
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"best[height<={height}][ext=mp4]/"
             f"best[height<={height}]/best"
-        ),
+        )
+
+    ydl_opts: dict = {
+        "format": fmt,
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "noplaylist": True,
+        "noplaylist": noplaylist,
         "quiet": True,
         "no_warnings": True,
-        "merge_output_format": "mp4",
         "retries": 5,
         "fragment_retries": 5,
         "extractor_retries": 3,
@@ -716,6 +768,17 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
             "Referer": referer,
         },
     }
+
+    if not audio_only:
+        ydl_opts["merge_output_format"] = "mp4"
+    else:
+        # فقط صدا: خروجی mp3 با ffmpeg (اصل فایل حذف می‌شود و
+        # فقط mp3 می‌ماند).
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
 
     if CURL_CFFI_AVAILABLE and _CHROME_IMPERSONATE_TARGET is not None:
         ydl_opts["impersonate"] = _CHROME_IMPERSONATE_TARGET
@@ -745,16 +808,86 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
     return ydl_opts
 
 
-def _fetch_info_sync(url: str) -> dict | None:
-    """اطلاعات ویدیو بدون دانلود فایل (عنوان + آدرس کاور)."""
+def _fetch_info_err_sync(url: str) -> tuple[dict | None, str]:
+    """اطلاعات ویدیو بدون دانلود فایل (عنوان + آدرس کاور).
+    برمی‌گرداند: (info یا None، متن خطا یا "")."""
     try:
         ydl_opts = _build_ydl_opts(url, 720, tempfile.gettempdir())
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-        return info if isinstance(info, dict) else None
-    except Exception:
+        return (info if isinstance(info, dict) else None), ""
+    except Exception as e:
         logger.exception("yt-dlp info fetch failed for %s", url)
+        return None, str(e)
+
+
+def _fetch_info_sync(url: str) -> dict | None:
+    """اطلاعات ویدیو بدون دانلود فایل (عنوان + آدرس کاور)."""
+    info, _err = _fetch_info_err_sync(url)
+    return info
+
+
+def _is_age_or_region_error(err: str) -> bool:
+    """True اگر خطای yt-dlp به محدودیت سنی/منطقه‌ای یا نیاز به
+    لاگین اشاره کند (یوتیوب)."""
+    low = (err or "").lower()
+    return any(
+        k in low
+        for k in (
+            "age", "sign in", "login", "log in", "region",
+            "not available in your country", "country",
+            "private video", "this video is unavailable",
+        )
+    )
+
+
+def parse_soundcloud_track(info: dict) -> tuple[str, str]:
+    """از info ساندکلود، (عنوان تمیز، خواننده) را برمی‌گرداند.
+    خواننده به ترتیب از `artist`، بعد `creator`، بعد `uploader`
+    می‌آید؛ اگر هیچ‌کدام نبود، از تقسیم عنوان روی اولین " - "
+    درمی‌آید. عنوان: اگر `track` باشد، همان است؛ وگرنه عنوان
+    روی اولین " - " تقسیم می‌شود (فقط وقتی خواننده از همان
+    تقسیم آمده باشد، یا قسمت چپ دقیقاً همان خواننده باشد).
+    هیچ‌وقت اسم خواننده دو بار تکرار نمی‌شود."""
+    track = str(info.get("track") or "").strip()
+    title_raw = str(info.get("title") or "").strip()
+    artist = str(
+        info.get("artist") or info.get("creator")
+        or info.get("uploader") or ""
+    ).strip()
+    if track:
+        if not artist and " - " in title_raw:
+            left, _, right = title_raw.partition(" - ")
+            if right.strip() == track:
+                artist = left.strip()
+        return track, artist
+    if " - " in title_raw:
+        left, _, right = title_raw.partition(" - ")
+        if not artist:
+            return right.strip(), left.strip()
+        if left.strip() == artist:
+            return right.strip(), artist
+    return title_raw, artist
+
+
+def _best_thumbnail_url(info: dict | None) -> str | None:
+    """بهترین (بزرگ‌ترین) کاور از info؛ اول از لیست thumbnails،
+    بعد thumbnail تکی."""
+    if not info:
         return None
+    best: str | None = None
+    best_area = -1
+    for t in info.get("thumbnails") or []:
+        if not isinstance(t, dict):
+            continue
+        u = t.get("url")
+        if not u:
+            continue
+        area = (t.get("width") or 0) * (t.get("height") or 0)
+        if area >= best_area:
+            best_area = area
+            best = u
+    return best or info.get("thumbnail")
 
 
 # ---------------------------------------------------------------------------
@@ -847,12 +980,7 @@ async def _try_direct_url_send(bot, chat_id: int, info: dict,
             fmt.get("format_id"),
         )
         return False
-    platform = detect_platform(info.get("webpage_url") or "")
-    referer = (
-        "https://www.pornhub.com/"
-        if platform == "pornhub"
-        else "https://www.instagram.com/"
-    )
+    referer = _referer_for(info.get("webpage_url") or "")
     size = fmt.get("filesize") or fmt.get("filesize_approx")
     if not size:
         size = await asyncio.to_thread(
@@ -891,7 +1019,8 @@ async def _try_direct_url_send(bot, chat_id: int, info: dict,
         return False
 
 
-def _download_cover_sync(thumb_url: str | None, tmpdir: str) -> Path | None:
+def _download_cover_sync(thumb_url: str | None, tmpdir: str,
+                         referer: str = "https://www.pornhub.com/") -> Path | None:
     """کاور ویدیو را دانلود می‌کند و به JPG تبدیل می‌کند (اگر webp/png
     بود). None اگر نشد."""
     if not thumb_url:
@@ -901,7 +1030,7 @@ def _download_cover_sync(thumb_url: str | None, tmpdir: str) -> Path | None:
             thumb_url,
             headers={
                 "User-Agent": CHROME_USER_AGENT,
-                "Referer": "https://www.pornhub.com/",
+                "Referer": referer,
             },
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -978,6 +1107,54 @@ def _download_once(url: str, height: int, outdir: str, tracker=None) -> tuple[st
         if p.is_file() and p.suffix.lower() not in skip_exts
     ]
     files.sort(key=lambda p: p.stat().st_size)
+    return title, files
+
+
+def _download_audio_once(url: str, outdir: str, tracker=None) -> tuple[str, list[Path]]:
+    """فقط بهترین صدا را دانلود و به mp3 تبدیل می‌کند (یوتیوب
+    صوتی و ساندکلود). برمی‌گرداند: (عنوان، فهرست فایل‌های mp3)."""
+    ydl_opts = _build_ydl_opts(
+        url, 720, outdir, tracker=tracker, audio_only=True
+    )
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    title = ""
+    if isinstance(info, dict):
+        title = str(info.get("title") or "")
+
+    files = [
+        p
+        for p in Path(outdir).iterdir()
+        if p.is_file() and p.suffix.lower() == ".mp3"
+    ]
+    files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    return title, files
+
+
+def _download_slideshow_sync(url: str, outdir: str,
+                             tracker=None) -> tuple[str, list[Path]]:
+    """دانلود اسلایدشوی عکس‌های تیک‌تاک (پلی‌لیست عکس‌ها).
+    ویدیوها اول می‌آیند، بعد عکس‌ها به ترتیب اسم. فقط وقتی
+    استفاده می‌شود که دانلود معمولی فایلی نداد."""
+    ydl_opts = _build_ydl_opts(
+        url, 720, outdir, tracker=tracker, noplaylist=False
+    )
+    ydl_opts["format"] = "best"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    title = ""
+    if isinstance(info, dict):
+        title = str(info.get("title") or "")
+
+    keep_exts = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm"}
+    files = [
+        p
+        for p in Path(outdir).iterdir()
+        if p.is_file() and p.suffix.lower() in keep_exts
+    ]
+    files.sort(key=lambda p: (0 if p.suffix.lower() in VIDEO_EXTS else 1, p.name))
     return title, files
 
 
@@ -1212,12 +1389,17 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
 async def send_files(bot, chat_id: int, files: list[Path],
                      captions: list | None = None,
                      thumb: Path | None = None,
-                     tracker: ProgressTracker | None = None) -> bool:
+                     tracker: ProgressTracker | None = None,
+                     audio_title: str | None = None,
+                     audio_performer: str | None = None,
+                     audio_duration: int | None = None) -> bool:
     """فایل‌ها را فقط با خود ربات (Bot API) می‌فرستد.
     captions هم‌طول files است. thumb (کاور) فقط برای اولین ویدیو
     استفاده می‌شود. اگر tracker داده شده باشد، قبل و بعد از هر
     قسمت درصد آپلود را به‌روز می‌کند تا پیام پیشرفت آپلود را
-    نشان بدهد. اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند."""
+    نشان بدهد. اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند.
+    برای فایل صوتی (mp3) عنوان، خواننده و مدت هم ست می‌شوند و
+    کاور به‌عنوان thumbnail آهنگ فرستاده می‌شود."""
     if not files:
         return False
 
@@ -1248,8 +1430,19 @@ async def send_files(bot, chat_id: int, files: list[Path],
                     if thumb_f is not None:
                         thumb_f.close()
             elif ext == ".mp3":
-                with open(path, "rb") as f:
-                    await bot.send_audio(chat_id=chat_id, audio=f)
+                thumb_f = None
+                if thumb is not None and i == 0 and thumb.is_file():
+                    thumb_f = open(thumb, "rb")
+                try:
+                    with open(path, "rb") as f:
+                        await bot.send_audio(
+                            chat_id=chat_id, audio=f, caption=caption,
+                            title=audio_title, performer=audio_performer,
+                            duration=audio_duration, thumbnail=thumb_f,
+                        )
+                finally:
+                    if thumb_f is not None:
+                        thumb_f.close()
             elif ext in (".jpg", ".jpeg", ".png", ".webp"):
                 with open(path, "rb") as f:
                     await bot.send_photo(
@@ -1272,11 +1465,18 @@ async def send_files(bot, chat_id: int, files: list[Path],
 async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
                    files: list[Path], was_split: bool,
                    caption_mode: str, thumb: Path | None = None,
-                   tracker: ProgressTracker | None = None) -> bool:
+                   tracker: ProgressTracker | None = None,
+                   audio_title: str | None = None,
+                   audio_performer: str | None = None,
+                   audio_caption: str | None = None,
+                   audio_duration: int | None = None) -> bool:
     """فایل‌های دانلودشده را می‌فرستد و True برمی‌گرداند اگر چیزی
     فرستاده شد. ارسال همیشه با خود ربات (Bot API) است.
     caption_mode: "instagram" → کپشن همه قسمت‌ها «@ربات ❤️»؛
     "title" → کپشن عنوان (قسمت‌ها با شماره قسمت).
+    برای فایل صوتی: audio_caption کپشن پیام آهنگ است و
+    audio_title/audio_performer عنوان و خواننده‌ای هستند که
+    توی خود فایل صوتی نمایش داده می‌شوند.
     ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول با
     Telethon bot client (خود ربات با BOT_TOKEN، تا ۲ گیگ) — بدون
     تقسیم، بدون فشرده‌سازی؛ ۳) اگر آن نشد، با حساب کاربری
@@ -1310,13 +1510,23 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
             (await build_captions(len(files), was_split))[files.index(p)]
             for p in small
         ]
+        # فایل صوتی: کپشن پیام آهنگ، جدای از کپشن ویدیوها.
+        if audio_caption is not None:
+            small_caps = [
+                audio_caption if p.suffix.lower() == ".mp3" else c
+                for p, c in zip(small, small_caps)
+            ]
         sent = await send_files(
-            bot, chat_id, small, small_caps, thumb=thumb, tracker=tracker
+            bot, chat_id, small, small_caps, thumb=thumb, tracker=tracker,
+            audio_title=audio_title, audio_performer=audio_performer,
+            audio_duration=audio_duration,
         )
 
     for path in large:
         caps = await build_captions(len(files), was_split)
         cap = caps[files.index(path)]
+        if audio_caption is not None and path.suffix.lower() == ".mp3":
+            cap = audio_caption
         thumb_arg = str(thumb) if thumb is not None else None
         # ۱) اول با خود ربات از طریق Telethon bot client (MTProto
         # با BOT_TOKEN، تا ۲ گیگ) — فرستنده خود ربات است، نه
@@ -1325,6 +1535,8 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
         if path.stat().st_size <= BOT_TELETHON_MAX_BYTES:
             if await send_via_telethon_bot(
                 chat_id, path, cap, thumb=thumb_arg, tracker=tracker,
+                audio_title=audio_title, audio_performer=audio_performer,
+                audio_duration=audio_duration,
             ):
                 sent = True
                 continue
@@ -1403,6 +1615,77 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
             except Exception:
                 logger.exception("download failed for %s", url)
                 return "error"
+            if not files:
+                return "empty"
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, files, was_split,
+                "instagram", tracker=tracker,
+            )
+            if sent:
+                return "ok"
+            if all(p.stat().st_size > MAX_BYTES for p in files):
+                return "too_big"
+            return "empty"
+    finally:
+        done.set()
+        watcher.cancel()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
+async def do_tiktok_download(bot, chat_id: int, url: str) -> str:
+    """دانلود تیک‌تاک — دقیقاً مثل اینستاگرام: دانلود مستقیم،
+    بدون منوی کیفیت، کپشن فقط «@ربات ❤️». برمی‌گرداند:
+    'ok' | 'too_big' | 'empty' | 'error'
+    اول لینک مستقیم امتحان می‌شود؛ اگر نشد دانلود معمولی.
+    اگر پست اسلایدشوی عکس باشد (دانلود معمولی فایلی نداد)،
+    عکس‌ها دانلود و به‌عنوان عکس فرستاده می‌شوند."""
+    tracker = ProgressTracker()
+    done = asyncio.Event()
+    status = await bot.send_message(
+        chat_id=chat_id, text=_progress_text(0, "info"),
+    )
+    watcher = asyncio.create_task(
+        _watch_progress(
+            bot, chat_id, status.message_id, tracker, done, False,
+        )
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="tt-") as tmpdir:
+            # ۱) اطلاعات + تلاش برای ارسال مستقیم با لینک
+            info = await asyncio.to_thread(_fetch_info_sync, url)
+            if info:
+                caption = await instagram_caption(bot)
+                if await _try_direct_url_send(
+                    bot, chat_id, info, 720, caption, None, tracker
+                ):
+                    return "ok"
+            # ۲) دانلود معمولی (فرگمنت موازی) — yt-dlp برای
+            # تیک‌تاک وقتی بتواند، استریم بدون واترمارک را
+            # می‌گیرد؛ اگر نشد همان بهترین کیفیت می‌آید.
+            try:
+                title, files, was_split = await download_best_effort(
+                    url, tmpdir,
+                    prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
+                    tracker=tracker,
+                )
+            except Exception:
+                logger.exception("download failed for %s", url)
+                return "error"
+            # ۳) اسلایدشوی عکس: اگر دانلود معمولی فایلی نداد،
+            # عکس‌ها را جدا دانلود کن و به‌عنوان عکس بفرست.
+            if not files:
+                try:
+                    subdir = Path(tmpdir) / "slideshow"
+                    subdir.mkdir(parents=True, exist_ok=True)
+                    title, files = await asyncio.to_thread(
+                        _download_slideshow_sync, url, str(subdir), tracker
+                    )
+                except Exception:
+                    logger.exception("slideshow download failed for %s", url)
+                    return "error"
             if not files:
                 return "empty"
             sent = await _deliver(
@@ -1582,8 +1865,314 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
                     pass
 
 
+async def do_youtube_download(bot, chat_id: int, url: str,
+                              height: int, audio: bool = False) -> str:
+    """دانلود یوتیوب — دقیقاً مثل پورن‌هاب: اول اطلاعات + کاور،
+    پیام پیشرفت با عکس کاور که هر ۵ ثانیه ویرایش می‌شود، بعد
+    دانلود با کیفیت انتخاب‌شده و ارسال ویدیو با همان کاور
+    به‌عنوان thumbnail. اگر audio=True باشد، فقط بهترین صدا
+    دانلود و به mp3 تبدیل می‌شود و با عنوان ویدیو فرستاده می‌شود.
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age'
+    ('age' یعنی ویدیو محدودیت سنی یا منطقه‌ای دارد)."""
+    with tempfile.TemporaryDirectory(prefix="yt-") as tmpdir:
+        tracker = ProgressTracker()
+        done = asyncio.Event()
+        progress_msg = None
+        is_photo = False
+        watcher = None
+
+        def _start_watcher() -> None:
+            nonlocal watcher
+            if progress_msg is not None:
+                watcher = asyncio.create_task(
+                    _watch_progress(
+                        bot, chat_id, progress_msg.message_id,
+                        tracker, done, is_photo,
+                    )
+                )
+
+        try:
+            # ۰) پیام پیشرفت از همان اول (فاز آماده‌سازی).
+            try:
+                progress_msg = await bot.send_message(
+                    chat_id=chat_id, text=_progress_text(0, "info"),
+                )
+                _start_watcher()
+            except Exception:
+                progress_msg = None
+                logger.exception("Could not send progress message")
+
+            # ۱) اطلاعات + کاور (بدون دانلود ویدیو)
+            info, info_err = await asyncio.to_thread(
+                _fetch_info_err_sync, url
+            )
+            if info is None and _is_age_or_region_error(info_err):
+                return "age"
+            title = str((info or {}).get("title") or "")
+            performer = str(
+                (info or {}).get("uploader")
+                or (info or {}).get("channel") or ""
+            )
+            cover = None
+            if info:
+                cover = await asyncio.to_thread(
+                    _download_cover_sync, info.get("thumbnail"), tmpdir,
+                    "https://www.youtube.com/",
+                )
+
+            # ۲) اگر کاور هست، پیام متنی را به عکس کاور تبدیل کن.
+            if cover is not None and progress_msg is not None:
+                try:
+                    if watcher is not None:
+                        watcher.cancel()
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                try:
+                    with open(cover, "rb") as f:
+                        progress_msg = await bot.send_photo(
+                            chat_id=chat_id, photo=f,
+                            caption=tracker.display_text(),
+                        )
+                    is_photo = True
+                    _start_watcher()
+                except Exception:
+                    progress_msg = None
+                    logger.exception("Could not send cover progress photo")
+
+            files: list[Path] = []
+            was_split = False
+            audio_duration: int | None = None
+
+            if audio:
+                # صوتی: بهترین صدا → mp3
+                subdir = Path(tmpdir) / "audio"
+                subdir.mkdir(parents=True, exist_ok=True)
+                try:
+                    dl_title, files = await asyncio.to_thread(
+                        _download_audio_once, url, str(subdir), tracker
+                    )
+                    if dl_title:
+                        title = dl_title
+                except Exception:
+                    logger.exception("yt-dlp audio failed for %s", url)
+                    files = []
+                if not files:
+                    return "error"
+            else:
+                # ۲٫۵) اول لینک مستقیم امتحان می‌شود؛ اگر نشد
+                # می‌رویم سراغ دانلود معمولی.
+                if info:
+                    if await _try_direct_url_send(
+                        bot, chat_id, info, height,
+                        title[:200] if title else None, cover, tracker,
+                    ):
+                        return "ok"
+
+                # ۳) دانلود با کیفیت انتخاب‌شده
+                subdir = Path(tmpdir) / f"h{height}"
+                subdir.mkdir(parents=True, exist_ok=True)
+                try:
+                    dl_title, files = await asyncio.to_thread(
+                        _download_once, url, height, str(subdir), tracker
+                    )
+                    if dl_title:
+                        title = dl_title
+                except Exception:
+                    logger.exception(
+                        "yt-dlp failed at %dp for %s", height, url
+                    )
+                    files = []
+
+                # ۴) اگر نشد، fallback به نردبان کیفیت
+                if not files:
+                    title, files, was_split = await download_best_effort(
+                        url, tmpdir,
+                        prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
+                        tracker=tracker,
+                    )
+                    if not files:
+                        return "error"
+
+            # ۵) ارسال (ویدیو با کاور / آهنگ با عنوان و خواننده)
+            if files and files[0].suffix.lower() == ".mp3":
+                dur = await asyncio.to_thread(
+                    _probe_duration_seconds, files[0]
+                )
+                if dur:
+                    audio_duration = int(dur)
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, files, was_split,
+                "title", thumb=cover, tracker=tracker,
+                audio_title=title[:200] if (audio and title) else None,
+                audio_performer=performer or None,
+                audio_caption=f"🎵 {title}" if (audio and title) else None,
+                audio_duration=audio_duration,
+            )
+            if sent:
+                return "ok"
+            if all(p.stat().st_size > MAX_BYTES for p in files):
+                return "too_big"
+            return "empty"
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+
+async def do_soundcloud_download(bot, chat_id: int, url: str) -> str:
+    """دانلود ساندکلود: اول کاور آهنگ با اسم آهنگ و خواننده،
+    بعد فایل صوتی mp3 با عنوان و خواننده درست.
+    اگر لینک پلی‌لیست باشد، فقط اولین آهنگ گرفته می‌شود.
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    پیام پیشرفت هر ۵ ثانیه روی پیام کاور ویرایش می‌شود؛ آخرش
+    کپشن کاور به اسم آهنگ و خواننده برمی‌گردد و پیام کاور
+    پاک نمی‌شود (برخلاف پورن‌هاب/یوتیوب که عکس پیشرفت موقت است)."""
+    with tempfile.TemporaryDirectory(prefix="sc-") as tmpdir:
+        tracker = ProgressTracker()
+        done = asyncio.Event()
+        progress_msg = None
+        is_photo = False
+        watcher = None
+
+        def _start_watcher() -> None:
+            nonlocal watcher
+            if progress_msg is not None:
+                watcher = asyncio.create_task(
+                    _watch_progress(
+                        bot, chat_id, progress_msg.message_id,
+                        tracker, done, is_photo,
+                    )
+                )
+
+        try:
+            # ۰) پیام پیشرفت از همان اول (فاز آماده‌سازی).
+            try:
+                progress_msg = await bot.send_message(
+                    chat_id=chat_id, text=_progress_text(0, "info"),
+                )
+                _start_watcher()
+            except Exception:
+                progress_msg = None
+                logger.exception("Could not send progress message")
+
+            # ۱) اطلاعات (تک‌آهنگ؛ اگر پلی‌لیست بود، اولین آهنگ)
+            info = await asyncio.to_thread(_fetch_info_sync, url)
+            if isinstance(info, dict) and info.get("entries"):
+                entries = [e for e in info["entries"] if isinstance(e, dict)]
+                info = entries[0] if entries else None
+            if not info:
+                return "error"
+            title, artist = parse_soundcloud_track(info)
+            if not title:
+                title = str(info.get("title") or "آهنگ")
+            final_caption = f"🎵 {title}"
+            if artist:
+                final_caption += f"\n👤 {artist}"
+
+            # ۲) کاور (بزرگ‌ترین کاور موجود)
+            cover = await asyncio.to_thread(
+                _download_cover_sync,
+                _best_thumbnail_url(info), tmpdir,
+                "https://soundcloud.com/",
+            )
+
+            # ۳) اگر کاور هست، پیام متنی را به عکس کاور تبدیل کن؛
+            # اگر نیست، همان پیام متنی پیشرفت می‌ماند.
+            if cover is not None and progress_msg is not None:
+                try:
+                    if watcher is not None:
+                        watcher.cancel()
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                try:
+                    with open(cover, "rb") as f:
+                        progress_msg = await bot.send_photo(
+                            chat_id=chat_id, photo=f,
+                            caption=tracker.display_text(),
+                        )
+                    is_photo = True
+                    _start_watcher()
+                except Exception:
+                    progress_msg = None
+                    logger.exception("Could not send cover progress photo")
+
+            # ۴) دانلود صدا → mp3
+            subdir = Path(tmpdir) / "audio"
+            subdir.mkdir(parents=True, exist_ok=True)
+            try:
+                dl_title, files = await asyncio.to_thread(
+                    _download_audio_once, url, str(subdir), tracker
+                )
+                if dl_title and not title:
+                    title = dl_title
+            except Exception:
+                logger.exception("yt-dlp audio failed for %s", url)
+                return "error"
+            if not files:
+                return "error"
+
+            # ۵) ارسال آهنگ (با همان کاور به‌عنوان thumbnail)
+            audio_duration: int | None = None
+            dur = await asyncio.to_thread(
+                _probe_duration_seconds, files[0]
+            )
+            if dur:
+                audio_duration = int(dur)
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, files, False,
+                "title", thumb=cover, tracker=tracker,
+                audio_title=title[:200],
+                audio_performer=artist or None,
+                audio_caption=final_caption,
+                audio_duration=audio_duration,
+            )
+            if not sent:
+                return "empty"
+
+            # ۶) کپشن پیام کاور را به اسم آهنگ و خواننده برگردان؛
+            # پیام کاور می‌ماند (پاک نمی‌شود).
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    if is_photo:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            caption=final_caption,
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=final_caption,
+                        )
+                except Exception:
+                    pass
+                progress_msg = None
+            return "ok"
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+
 async def _background_download(bot, chat_id: int, url: str,
-                               platform: str, height: int | None = None) -> None:
+                               platform: str, height: int | None = None,
+                               audio: bool = False) -> None:
     """دانلود را در پس‌زمینه اجرا می‌کند تا هندلر فوراً برگردد و
     ربات به دستورهای دیگر جواب بدهد. پیام خطا را خودش می‌فرستد.
     تا ۳ دانلود هم‌زمان؛ اگر هر ۳ اسلات پر بود، به کاربر می‌گوید
@@ -1603,6 +2192,14 @@ async def _background_download(bot, chat_id: int, url: str,
     try:
         if platform == "pornhub":
             result = await do_pornhub_download(bot, chat_id, url, height or 720)
+        elif platform == "youtube":
+            result = await do_youtube_download(
+                bot, chat_id, url, height or 720, audio=audio
+            )
+        elif platform == "tiktok":
+            result = await do_tiktok_download(bot, chat_id, url)
+        elif platform == "soundcloud":
+            result = await do_soundcloud_download(bot, chat_id, url)
         else:
             result = await do_instagram_download(bot, chat_id, url)
     except Exception:
@@ -1614,6 +2211,8 @@ async def _background_download(bot, chat_id: int, url: str,
     try:
         if result == "too_big":
             await bot.send_message(chat_id=chat_id, text=TOO_BIG_TEXT)
+        elif result == "age":
+            await bot.send_message(chat_id=chat_id, text=AGE_RESTRICTED_TEXT)
         elif result in ("empty", "error"):
             await bot.send_message(chat_id=chat_id, text=ERROR_TEXT)
     except Exception:
@@ -1694,6 +2293,97 @@ async def pornhub_quality_callback(
         _background_download(
             context.bot, pending["chat_id"], pending["url"],
             "pornhub", height,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# منوی انتخاب کیفیت یوتیوب (مثل پورن‌هاب، با گزینه صوتی)
+# ---------------------------------------------------------------------------
+
+# دانلودهای یوتیوب در انتظار انتخاب کیفیت: key کوتاه → {url, chat_id}
+# پیشوند callback جدا است (`yt:` در برابر `ph:`) تا هیچ‌وقت با
+# منوی پورن‌هاب قاطی نشود.
+PENDING_YOUTUBE: dict[str, dict] = {}
+
+
+async def _offer_youtube_quality(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE,
+                                 url: str) -> None:
+    """منوی شیشه‌ای انتخاب کیفیت یوتیوب: دو ستونه، با ایموجی و
+    برچسب تمیز + گزینه صوتی (mp3)."""
+    key = uuid.uuid4().hex[:8]
+    PENDING_YOUTUBE[key] = {
+        "url": url,
+        "chat_id": update.message.chat.id,
+    }
+    keyboard = [
+        [
+            InlineKeyboardButton("✨ 1080p", callback_data=f"yt:{key}:1080"),
+            InlineKeyboardButton("🎞️ 720p", callback_data=f"yt:{key}:720"),
+        ],
+        [
+            InlineKeyboardButton("📺 480p", callback_data=f"yt:{key}:480"),
+            InlineKeyboardButton("📱 360p", callback_data=f"yt:{key}:360"),
+        ],
+        [InlineKeyboardButton("🎵 صوتی (mp3)", callback_data=f"yt:{key}:audio")],
+        [InlineKeyboardButton("❌ لغو", callback_data=f"yt:{key}:cancel")],
+    ]
+    await update.message.reply_text(
+        "🎬 کیفیت ویدیو رو انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def youtube_quality_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """کلیک روی منوی کیفیت یوتیوب: دانلود با همان کیفیت (یا صوتی)،
+    در پس‌زمینه."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "yt":
+        return
+    _, key, choice = parts
+    pending = PENDING_YOUTUBE.pop(key, None)
+    if pending is None:
+        try:
+            await query.edit_message_text("منقضی شده؛ لینک رو دوباره بفرست.")
+        except Exception:
+            pass
+        return
+    if choice == "cancel":
+        try:
+            await query.edit_message_text("لغو شد.")
+        except Exception:
+            pass
+        return
+    try:
+        await query.delete_message()
+    except Exception:
+        try:
+            await query.edit_message_text("⏳")
+        except Exception:
+            pass
+    if choice == "audio":
+        asyncio.create_task(
+            _background_download(
+                context.bot, pending["chat_id"], pending["url"],
+                "youtube", None, audio=True,
+            )
+        )
+        return
+    try:
+        height = int(choice)
+    except ValueError:
+        return
+    asyncio.create_task(
+        _background_download(
+            context.bot, pending["chat_id"], pending["url"],
+            "youtube", height,
         )
     )
 
@@ -1902,7 +2592,8 @@ async def handle_makesession_step(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هر پیام متنی: لینک اینستا/پورن‌هاب را پردازش کن؛ اگر نه، رد شو.
+    """هر پیام متنی: لینک اینستا/تیک‌تاک/یوتیوب/پورن‌هاب/ساندکلود
+    را پردازش کن؛ اگر نه، رد شو.
     دانلود در پس‌زمینه اجرا می‌شود تا ربات به بقیه دستورها جواب بدهد."""
     msg = update.message
     if msg is None or not msg.text:
@@ -1914,13 +2605,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     url = find_url(msg.text)
     if not url:
         if msg.chat.type == "private":
-            await msg.reply_text("لینک اینستاگرام یا پورن‌هاب رو بفرست.")
+            await msg.reply_text("لینک بفرست.")
         return
 
     platform = detect_platform(url)
     if not platform:
         if msg.chat.type == "private":
-            await msg.reply_text("فقط اینستاگرام و پورن‌هاب.")
+            await msg.reply_text(
+                "فقط اینستاگرام، تیک‌تاک، یوتیوب، پورن‌هاب و ساندکلود."
+            )
         return
 
     if platform == "pornhub":
@@ -1928,9 +2621,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _offer_pornhub_quality(update, context, url)
         return
 
-    # اینستاگرام: دانلود مستقیم، در پس‌زمینه.
+    if platform == "youtube":
+        # یوتیوب: مثل پورن‌هاب — اول منوی انتخاب کیفیت (با گزینه صوتی).
+        await _offer_youtube_quality(update, context, url)
+        return
+
+    # اینستاگرام، تیک‌تاک و ساندکلود: دانلود مستقیم، در پس‌زمینه.
     asyncio.create_task(
-        _background_download(context.bot, msg.chat.id, url, "instagram")
+        _background_download(context.bot, msg.chat.id, url, platform)
     )
 
 
@@ -1957,6 +2655,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("makesession", makesession_cmd))
     app.add_handler(CallbackQueryHandler(pornhub_quality_callback, pattern=r"^ph:"))
+    app.add_handler(CallbackQueryHandler(youtube_quality_callback, pattern=r"^yt:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
