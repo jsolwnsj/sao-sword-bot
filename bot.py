@@ -1196,13 +1196,23 @@ def _run_ffmpeg_progress(args: list[str], duration_s: float | None,
     cmd = list(args[:-1]) + ["-progress", "pipe:1", "-nostats", args[-1]]
     if tracker is not None:
         tracker.set_phase(phase, 0)
+    # stderr به فایل موقت می‌رود (نه PIPE که ممکن است deadlock بدهد
+    # و نه DEVNULL که دلیل واقعی شکست را قایم می‌کند)؛ اگر ffmpeg
+    # با خطا برگشت، دنباله خطا لاگ می‌شود.
+    err_file = None
     try:
+        err_file = tempfile.TemporaryFile()
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.PIPE, stderr=err_file,
             text=True,
         )
     except Exception:
         logger.exception("ffmpeg start failed")
+        if err_file is not None:
+            try:
+                err_file.close()
+            except OSError:
+                pass
         return 1
     try:
         assert proc.stdout is not None
@@ -1218,7 +1228,26 @@ def _run_ffmpeg_progress(args: list[str], duration_s: float | None,
                     tracker.set_phase(phase, pct)
     except Exception:
         pass
-    return proc.wait()
+    rc = proc.wait()
+    if err_file is not None:
+        try:
+            err_file.seek(0, os.SEEK_END)
+            size = err_file.tell()
+            err_file.seek(max(0, size - 2048))
+            tail = err_file.read().decode("utf-8", errors="replace")
+            if rc != 0 and tail.strip():
+                logger.warning(
+                    "ffmpeg rc=%d for %s: %s", rc, args[-1],
+                    tail.strip()[-2048:],
+                )
+        except Exception:
+            pass
+        finally:
+            try:
+                err_file.close()
+            except OSError:
+                pass
+    return rc
 
 
 def _split_video_sync(path: Path, workdir: Path,
@@ -2086,12 +2115,26 @@ def _probe_range_support_sync(url: str,
         return "unknown"
 
 
+def _refresh_download_tracker(tracker, downloaded: int, t0: float,
+                              total: int) -> None:
+    """downloaded/speed/ETA ترکر را از مجموع واقعی بایت‌ها می‌سازد."""
+    elapsed = time.monotonic() - t0
+    tracker.downloaded = downloaded
+    tracker.speed = downloaded / elapsed if elapsed > 0 else 0
+    if total and tracker.speed > 0:
+        tracker.eta = int((total - downloaded) / tracker.speed)
+
+
 def _download_part_sync(url: str, start: int, end: int, part_path: Path,
-                        counter: list, lock: threading.Lock,
+                        part_counters: list, part_idx: int,
+                        lock: threading.Lock,
                         tracker, t0: float, total: int,
                         attempts: int = 3) -> str:
     """یک بازه بایتی را با Range دانلود می‌کند؛ هر قسمت خودش تا
     ۳ بار امتحان می‌شود (فقط همان قسمت، نه کل فایل).
+    شمارنده پیشرفت برای هر قسمت جداست و با شروع هر تلاش دوباره
+    صفر می‌شود؛ ترکر همیشه مجموع واقعی بایت‌های دانلودشده را
+    نشان می‌دهد و هیچ‌وقت از بایت‌های واقعی جلو نمی‌زند.
     برمی‌گرداند: "ok" | "forbidden" | "gone" | "no_range" | "failed"."""
     size = end - start + 1
     headers = {
@@ -2100,6 +2143,14 @@ def _download_part_sync(url: str, start: int, end: int, part_path: Path,
         "Range": f"bytes={start}-{end}",
     }
     for attempt in range(1, attempts + 1):
+        # تلاش دوباره از صفر همین قسمت شروع می‌شود، پس بایت‌های
+        # تلاش قبلی نباید دوباره شمرده شوند.
+        if tracker is not None:
+            with lock:
+                part_counters[part_idx] = 0
+                _refresh_download_tracker(
+                    tracker, sum(part_counters), t0, total
+                )
         try:
             if part_path.is_file():
                 part_path.unlink()
@@ -2122,16 +2173,10 @@ def _download_part_sync(url: str, start: int, end: int, part_path: Path,
                         f.write(chunk)
                         if tracker is not None:
                             with lock:
-                                counter[0] += len(chunk)
-                                elapsed = time.monotonic() - t0
-                                tracker.downloaded = counter[0]
-                                tracker.speed = (
-                                    counter[0] / elapsed if elapsed > 0 else 0
+                                part_counters[part_idx] += len(chunk)
+                                _refresh_download_tracker(
+                                    tracker, sum(part_counters), t0, total
                                 )
-                                if total and tracker.speed > 0:
-                                    tracker.eta = int(
-                                        (total - counter[0]) / tracker.speed
-                                    )
                 if part_path.is_file() \
                         and part_path.stat().st_size == size:
                     return "ok"
@@ -2177,7 +2222,9 @@ def _download_ranged_sync(url: str, dest: Path, total: int, tracker=None,
         tracker.speed = 0.0
         tracker.eta = 0
     t0 = time.monotonic()
-    counter = [0]
+    # شمارنده جدا برای هر قسمت؛ ترکر مجموع آن‌هاست، پس تلاش
+    # دوباره یک قسمت، بایت‌های تلاش قبلی را دو بار نمی‌شمارد.
+    part_counters = [0] * nparts
     lock = threading.Lock()
     part_paths = [
         dest.parent / f"{dest.name}.part{i}" for i in range(nparts)
@@ -2194,7 +2241,7 @@ def _download_ranged_sync(url: str, dest: Path, total: int, tracker=None,
             futs = {
                 ex.submit(
                     _download_part_sync, url, s, e, part_paths[i],
-                    counter, lock, tracker, t0, total, attempts,
+                    part_counters, i, lock, tracker, t0, total, attempts,
                 ): i
                 for i, (s, e) in enumerate(bounds)
             }
@@ -2576,7 +2623,11 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                     )
                     if not ok:
                         return "error"
-                    merged = subdir / "video.mp4"
+                    # خروجی میکس حتماً باید اسمش با ورودی فرق کند؛
+                    # ffmpeg روی همان فایل ورودی نمی‌نویسد و با
+                    # "same as Input" رد می‌کند (قبلاً merged همان
+                    # video.mp4 بود و میکس همیشه می‌مرد).
+                    merged = subdir / "merged.mp4"
                     rc = await asyncio.to_thread(
                         _mux_video_audio_sync, vpath, apath, merged,
                         duration_s, tracker,
