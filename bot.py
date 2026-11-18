@@ -551,6 +551,11 @@ TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
 
 AGE_RESTRICTED_TEXT = "این ویدیو محدودیت سنی یا منطقه‌ای داره. 😕"
 
+# یوتیوب IP سرور را با چک ربات رد کرده (همه کلاینت‌ها با خطای
+# لاگین/ربات رد شده‌اند) — نه محدودیت سنی ویدیو، نه خطای عمومی؛
+# با کوکی لاگین‌شده یوتیوب درست می‌شود (بخش کوکی در README).
+BLOCKED_TEXT = "یوتیوب فعلاً سرور رو بلاک کرده؛ با کوکی درست می‌شه. 😕"
+
 ERROR_TEXT = "نشد دانلودش کنم. 😕"
 
 
@@ -649,9 +654,18 @@ YOUTUBE_COOKIES_FILE = Path(
 # ولی روی IP دیتاسنتر (ریل‌وی) یوتیوب به کلاینت web خیلی وقت‌ها
 # صفحه «Sign in to confirm you're not a bot» می‌دهد و استخراج
 # با خطای فرمت/لاگین می‌افتد — آن خطا محدودیت سنی نیست، پس باید
-# با کلاینت بعدی (android، بعد ios، بعد tv) دوباره امتحان شود.
-# android معمولاً رد می‌شود ولی فقط تا ۳۶۰p فرمت دارد (format 18).
-YOUTUBE_CLIENTS = ("web", "android", "ios", "tv")
+# با کلاینت‌های بعدی دوباره امتحان شود. android معمولاً رد
+# می‌شود ولی فقط تا ۳۶۰p فرمت دارد (format 18).
+# فهرست فقط کلاینت‌هایی را دارد که yt-dlp 2026.10.26 واقعاً
+# می‌شناسد (کلیدهای INNERTUBE_CLIENTS): اسم‌های قدیمی tv_embedded
+# و android_music و ios_music را این نسخه رد می‌کند («Skipping
+# unsupported client») و با آن‌ها عملاً دوباره web امتحان
+# می‌شود؛ به‌جایشان web_embedded (کلاینت embed واقعی، برای رد
+# کردن گیت سنی) و tv_samsung و tv_simply آمده‌اند.
+YOUTUBE_CLIENTS = (
+    "web", "android", "ios", "tv", "web_safari", "web_embedded",
+    "tv_samsung", "tv_simply", "web_music", "mweb",
+)
 _IMPERSONATION_WARNING_LOGGED = False
 
 
@@ -948,6 +962,23 @@ def _is_signin_or_bot_error(err: str) -> bool:
     )
 
 
+def _youtube_verdict(errors: list[str], exhausted: bool) -> str:
+    """نتیجه نهایی یوتیوب از روی خطاهای همه کلاینت‌ها:
+    همه سنی/منطقه‌ای → "age"؛ همه چک لاگین/ربات → "blocked"؛
+    بقیه (از جمله مخلوط) → "error". exhausted یعنی حلقه همه
+    کلاینت‌هایش را امتحان کرده و وسط راه با خطای دیگری نبریده
+    است؛ اگر حلقه زود بریده باشد یا خطایی نباشد، نتیجه "error"
+    است. ترتیب مهم است: خطای واقعی سنی در _is_signin_or_bot_error
+    همیشه False است، پس فهرستِ همه‌سنی فقط به "age" می‌رسد."""
+    if not exhausted or not errors:
+        return "error"
+    if all(_is_age_or_region_error(e) for e in errors):
+        return "age"
+    if all(_is_signin_or_bot_error(e) for e in errors):
+        return "blocked"
+    return "error"
+
+
 def _youtube_client_order(start_client: str | None = None) -> list[str]:
     """ترتیب کلاینت‌های یوتیوب از کلاینت شروع به بعد؛ اگر کلاینت
     شروع معلوم نباشد، همه به ترتیب YOUTUBE_CLIENTS."""
@@ -959,13 +990,16 @@ def _youtube_client_order(start_client: str | None = None) -> list[str]:
 
 def _fetch_youtube_info_err_sync(
     url: str,
-) -> tuple[dict | None, str, str | None]:
+) -> tuple[dict | None, str, str | None, list[str]]:
     """اطلاعات ویدیوی یوتیوب بدون دانلود، با fallback کلاینت‌های
-    پخش‌کننده: web، بعد android، بعد ios، بعد tv. اولین موفقی
-    را با همان کلاینت برمی‌گرداند. اگر همه رد شدند، (None،
-    آخرین خطا، None) می‌دهد — تصمیم «سنی/منطقه‌ای یا خطای
-    عمومی» با فراخوان است، نه اینجا."""
+    پخش‌کننده (به ترتیب YOUTUBE_CLIENTS: web، android، ios، tv،
+    web_safari، web_embedded، tv_samsung، tv_simply، web_music،
+    mweb). اولین موفقی را با همان کلاینت برمی‌گرداند. اگر همه رد
+    شدند، (None، آخرین خطا، None، فهرست خطای هر کلاینت) می‌دهد —
+    تصمیم «سنی/منطقه‌ای، بلاک سرور، یا خطای عمومی» با فراخوان
+    است (تابع _youtube_verdict)، نه اینجا."""
     last_err = ""
+    errors: list[str] = []
     for client in YOUTUBE_CLIENTS:
         try:
             ydl_opts = _build_ydl_opts(
@@ -979,15 +1013,17 @@ def _fetch_youtube_info_err_sync(
                     "YouTube info OK via player_client=%s for %s",
                     client, url,
                 )
-                return info, "", client
+                return info, "", client, errors
             last_err = "empty info"
+            errors.append(last_err)
         except Exception as e:
             last_err = str(e)
+            errors.append(last_err)
             logger.warning(
                 "YouTube info failed via player_client=%s for %s: %s",
                 client, url, last_err[:200],
             )
-    return None, last_err, None
+    return None, last_err, None, errors
 
 
 def parse_soundcloud_track(info: dict) -> tuple[str, str]:
@@ -2039,14 +2075,17 @@ async def do_youtube_download(bot, chat_id: int, url: str,
     به‌عنوان thumbnail. اگر audio=True باشد، فقط بهترین صدا
     دانلود و به mp3 تبدیل می‌شود و با عنوان ویدیو فرستاده می‌شود.
     اطلاعات و دانلود با fallback کلاینت‌های پخش‌کننده یوتیوب
-    انجام می‌شود (web، بعد android، بعد ios، بعد tv): روی IP
+    انجام می‌شود (به ترتیب YOUTUBE_CLIENTS — ده کلاینت): روی IP
     دیتاسنتر کلاینت web خیلی وقت‌ها صفحه «Sign in to confirm
     you're not a bot» می‌دهد و آن خطا محدودیت سنی نیست — پس
     با کلاینت بعدی دوباره امتحان می‌شود. «age» فقط وقتی
     برمی‌گردد که همه کلاینت‌ها رد شوند و خطا واقعاً سنی یا
-    منطقه‌ای باشد.
-    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age'
-    ('age' یعنی ویدیو محدودیت سنی یا منطقه‌ای دارد)."""
+    منطقه‌ای باشد؛ اگر همه با چک ربات رد شوند، "blocked"
+    برمی‌گردد (یوتیوب سرور را بلاک کرده و فقط با کوکی درست
+    می‌شود).
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age' | 'blocked'
+    ('age' یعنی ویدیو محدودیت سنی یا منطقه‌ای دارد؛ 'blocked'
+    یعنی یوتیوب همه کلاینت‌ها را با چک ربات رد کرده است)."""
     with tempfile.TemporaryDirectory(prefix="yt-") as tmpdir:
         tracker = ProgressTracker()
         done = asyncio.Event()
@@ -2076,17 +2115,15 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 logger.exception("Could not send progress message")
 
             # ۱) اطلاعات + کاور (بدون دانلود ویدیو) — با fallback
-            # کلاینت‌های یوتیوب. «age» فقط وقتی همه کلاینت‌ها رد
-            # شوند و خطا واقعاً سنی/منطقه‌ای باشد؛ هر خطای دیگر
-            # (مثلاً چک ربات یا «Requested format is not available»)
-            # خطای عمومی است، نه محدودیت سنی.
-            info, info_err, yt_client = await asyncio.to_thread(
+            # کلاینت‌های یوتیوب (به ترتیب YOUTUBE_CLIENTS). نتیجه
+            # را _youtube_verdict از روی خطای همه کلاینت‌ها
+            # می‌سازد: همه سنی/منطقه‌ای → "age"، همه چک ربات →
+            # "blocked"، بقیه → "error".
+            info, info_err, yt_client, info_errors = await asyncio.to_thread(
                 _fetch_youtube_info_err_sync, url
             )
             if info is None:
-                if _is_age_or_region_error(info_err):
-                    return "age"
-                return "error"
+                return _youtube_verdict(info_errors, True)
             title = str((info or {}).get("title") or "")
             performer = str(
                 (info or {}).get("uploader")
@@ -2130,6 +2167,8 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 subdir = Path(tmpdir) / "audio"
                 subdir.mkdir(parents=True, exist_ok=True)
                 files = []
+                dl_errors: list[str] = []
+                dl_broke_early = False
                 for _client in _youtube_client_order(yt_client):
                     try:
                         dl_title, files = await asyncio.to_thread(
@@ -2147,13 +2186,15 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                                 "for %s; trying next client",
                                 _client, url,
                             )
+                            dl_errors.append(str(e))
                             files = []
                             continue
                         logger.exception("yt-dlp audio failed for %s", url)
                         files = []
+                        dl_broke_early = True
                         break
                 if not files:
-                    return "error"
+                    return _youtube_verdict(dl_errors, not dl_broke_early)
             else:
                 # ۲٫۵) اول لینک مستقیم امتحان می‌شود؛ اگر نشد
                 # می‌رویم سراغ دانلود معمولی.
@@ -2170,6 +2211,8 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 subdir = Path(tmpdir) / f"h{height}"
                 subdir.mkdir(parents=True, exist_ok=True)
                 files = []
+                dl_errors: list[str] = []
+                dl_broke_early = False
                 for _client in _youtube_client_order(yt_client):
                     try:
                         dl_title, files = await asyncio.to_thread(
@@ -2187,12 +2230,14 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                                 "for %s; trying next client",
                                 height, _client, url,
                             )
+                            dl_errors.append(str(e))
                             files = []
                             continue
                         logger.exception(
                             "yt-dlp failed at %dp for %s", height, url
                         )
                         files = []
+                        dl_broke_early = True
                         break
 
                 # ۴) اگر نشد، fallback به نردبان کیفیت
@@ -2204,7 +2249,9 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                         youtube_client=yt_client,
                     )
                     if not files:
-                        return "error"
+                        return _youtube_verdict(
+                            dl_errors, not dl_broke_early
+                        )
 
             # ۵) ارسال (ویدیو با کاور / آهنگ با عنوان و خواننده)
             if files and files[0].suffix.lower() == ".mp3":
@@ -2425,6 +2472,8 @@ async def _background_download(bot, chat_id: int, url: str,
             await bot.send_message(chat_id=chat_id, text=TOO_BIG_TEXT)
         elif result == "age":
             await bot.send_message(chat_id=chat_id, text=AGE_RESTRICTED_TEXT)
+        elif result == "blocked":
+            await bot.send_message(chat_id=chat_id, text=BLOCKED_TEXT)
         elif result in ("empty", "error"):
             await bot.send_message(chat_id=chat_id, text=ERROR_TEXT)
     except Exception:
