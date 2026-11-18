@@ -6,20 +6,22 @@
 - اینستا: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
 - پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
   پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
-- فایل بزرگ: اول فشرده می‌شود (ffmpeg، حداکثر ۴۸۰p) تا زیر ۴۸ مگ
-  جا شود و فقط اگر فشرده هم جا نشد تقسیم می‌شود. ارسال فقط با
-  خود ربات (Bot API) است؛ ارسال با حساب کاربری (Telethon/MTProto)
-  پیش‌فرض خاموش است و فقط اگر TELETHON_SEND_ENABLED=true ست شده
-  باشد استفاده می‌شود.
+- فایل بزرگ: اول با کیفیت پایین‌تر مستقیم دانلود می‌شود
+  (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و فقط اگر کوچک‌ترین دانلود مستقیم
+  هم بالای ۴۸ مگ بود، با ffmpeg -c copy (بدون ریکد) تقسیم
+  می‌شود. فشرده‌سازی (ریکد) حذف شده است چون خیلی طول می‌کشید.
+  ارسال فقط با خود ربات (Bot API) است؛ ارسال با حساب کاربری
+  (Telethon/MTProto) پیش‌فرض خاموش است و فقط اگر
+  TELETHON_SEND_ENABLED=true ست شده باشد استفاده می‌شود.
 - پیام پیشرفت همه فازها را نشان می‌دهد: آماده‌سازی، دانلود،
-  ارسال مستقیم، فشرده‌سازی، تقسیم و آپلود — هر کدام با نوار،
+  ارسال مستقیم، تقسیم و آپلود — هر کدام با نوار،
   درصد، سرعت و ETA؛ هر ۵ ثانیه در همان پیام ویرایش می‌شود.
 - تا ۳ دانلود هم‌زمان؛ دانلود چهارم به بعد توی صف می‌ماند.
   هر دانلود پوشه، پیام و ترکر خودش را دارد.
 - ارسال سریع پورن‌هاب: اول سعی می‌شود لینک مستقیم mp4 (بدون
   دانلود روی ریل‌وی) مستقیم به تلگرام فرستاده شود؛ اگر نشد
   (لینک IP-bound است یا تلگرام نمی‌تواند بگیرد)، مسیر قدیمی
-  دانلود-با-فرگمنت‌های موازی + فشرده‌سازی اجرا می‌شود.
+  دانلود-با-فرگمنت‌های موازی اجرا می‌شود.
 - دانلودها در پس‌زمینه اجرا می‌شوند تا ربات به دستورهای دیگر
   جواب بدهد.
 - BOT_TOKEN از متغیر محیطی.
@@ -140,7 +142,6 @@ _PHASE_META = {
     "info": ("⏳", "آماده‌سازی"),
     "download": ("📥", "دانلود"),
     "direct": ("🔗", "ارسال مستقیم"),
-    "compress": ("🗜️", "فشرده‌سازی"),
     "split": ("✂️", "تقسیم"),
     "upload": ("📤", "آپلود"),
     "done": ("✅", "تمام شد"),
@@ -149,7 +150,7 @@ _PHASE_META = {
 
 class ProgressTracker:
     """وضعیت همه فازها: آماده‌سازی، دانلود، ارسال مستقیم،
-    فشرده‌سازی، تقسیم، آپلود. هوک yt-dlp و ffmpeg و ارسال‌کننده‌ها
+    تقسیم، آپلود. هوک yt-dlp و ffmpeg و ارسال‌کننده‌ها
     از توی thread فقط چند عدد را به‌روز می‌کنند و یک تسک جداگانه
     پیام پیشرفت را هر ۵ ثانیه ویرایش می‌کند. هیچ فازی ساکت نیست."""
 
@@ -252,7 +253,7 @@ class ProgressTracker:
             )
             text = f"{icon} {label} {_bar(pct)} {pct}٪"
             return text + (f" • {extra}" if extra else "")
-        if self.phase in ("compress", "split"):
+        if self.phase == "split":
             if self.phase_percent is None:
                 return f"{icon} {label}…"
             pct = self.phase_percent
@@ -358,7 +359,7 @@ async def send_via_telethon(chat_id: int, path: Path, caption: str | None,
     سقف ۲ گیگابایت. فقط وقتی صدا زده می‌شود که
     TELETHON_SEND_ENABLED=true باشد؛ پیش‌فرض خاموش است و ویدیوها
     فقط با خود ربات فرستاده می‌شوند. در صورت هر خطایی False
-    برمی‌گرداند تا مسیر فشرده/تقسیم استفاده شود.
+    برمی‌گرداند تا مسیر تقسیم استفاده شود.
     نکته: حساب کاربری باید عضو گروه باشد (برای ارسال به گروه) یا با
     گیرنده دیالوگ داشته باشد (برای پی‌وی).
     """
@@ -668,7 +669,7 @@ def _fetch_info_sync(url: str) -> dict | None:
 # پس این مسیر فقط وقتی امتحان می‌شود که (۱) فرمت mp4 مستقیم باشد،
 # (۲) لینک به IP قفل نباشد، (۳) حجم معلوم و زیر ۴۸ مگ باشد. اگر هر
 # کدام نبود، بدون معطلی برمی‌گردیم به مسیر دانلود-با-فرگمنت-موازی
-# + فشرده‌سازی؛ اگر هم تلگرام نتوانست بگیرد، همان‌جا fallback می‌شود.
+# اگر هم تلگرام نتوانست بگیرد، همان‌جا fallback می‌شود.
 # لاگ مشخص می‌کند کدام مسیر استفاده شد: "direct-url" یا دلیل skip.
 
 def _is_ip_bound_url(url: str) -> bool:
@@ -980,69 +981,14 @@ def _split_video_sync(path: Path, workdir: Path,
     return [p for p in parts if p.is_file() and p.stat().st_size > 0] or [path]
 
 
-def _compress_video_sync(path: Path, workdir: Path, height: int,
-                         crf: int,
-                         tracker: ProgressTracker | None = None) -> Path | None:
-    """ویدیو را با ffmpeg ریکد می‌کند (H.264، preset خیلی سریع،
-    صدا AAC ۹۶k). خروجی را برمی‌گرداند فقط اگر از فایل اصلی
-    کوچک‌تر بود؛ وگرنه None. کیفیت تماشایی می‌ماند.
-    درصد فشرده‌سازی توی ترکر می‌آید."""
-    workdir.mkdir(parents=True, exist_ok=True)
-    out = workdir / f"{path.stem}_c{height}.mp4"
-    duration = _probe_duration_seconds(path)
-    rc = _run_ffmpeg_progress(
-        [
-            "ffmpeg", "-y", "-i", str(path),
-            "-vf", f"scale=-2:{height}",
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", str(crf),
-            "-c:a", "aac", "-b:a", "96k",
-            "-movflags", "+faststart", str(out),
-        ],
-        duration, tracker, "compress",
-    )
-    if rc != 0:
-        logger.warning("ffmpeg compress failed for %s (rc=%d)", path, rc)
-        try:
-            out.unlink()
-        except OSError:
-            pass
-        return None
-    if (
-        out.is_file()
-        and 0 < out.stat().st_size < path.stat().st_size
-    ):
-        return out
-    try:
-        out.unlink()
-    except OSError:
-        pass
-    return None
-
-
 async def _fit_for_bot_api(path: Path, tmpdir: str,
                            tracker: ProgressTracker | None = None) -> list[Path]:
     """فایل را برای ارسال با Bot API جا می‌کند: اگر زیر ۴۸ مگ است
-    همان را برمی‌گرداند؛ وگرنه اول فشرده می‌کند (۴۸۰p با crf 28،
-    بعد ۳۶۰p با crf 30) تا یک فایل زیر ۴۸ مگ شود و فقط اگر فشرده
-    هم جا نشد تقسیم می‌کند. یک فایل فشرده خیلی سریع‌تر از چند
-    قسمت آپلود می‌شود. درصد فشرده‌سازی/تقسیم توی ترکر می‌آید."""
+    همان را برمی‌گرداند؛ وگرنه با ffmpeg -c copy (بدون ریکد،
+    سریع) به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند. فشرده‌سازی (ریکد)
+    حذف شده است چون خیلی طول می‌کشید. درصد تقسیم توی ترکر می‌آید."""
     if path.stat().st_size <= MAX_BYTES:
         return [path]
-    if path.suffix.lower() in VIDEO_EXTS:
-        workdir = Path(tmpdir) / f"compress-{path.stem}"
-        for height, crf in ((480, 28), (360, 30)):
-            compressed = await asyncio.to_thread(
-                _compress_video_sync, path, workdir, height, crf, tracker
-            )
-            if compressed is not None and compressed.stat().st_size <= MAX_BYTES:
-                logger.info(
-                    "Compressed %s (%d bytes) to %d bytes (%dp crf %d)",
-                    path, path.stat().st_size,
-                    compressed.stat().st_size, height, crf,
-                )
-                return [compressed]
-        logger.info("Compress did not fit %s; splitting", path)
     parts_dir = Path(tmpdir) / f"parts-{path.stem}"
     parts = await asyncio.to_thread(
         _split_video_sync, path, parts_dir, tracker
@@ -1119,7 +1065,7 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
     main = max(files, key=lambda p: p.stat().st_size)
     if main.stat().st_size <= MAX_BYTES:
         return title, files, False
-    # اول فشرده کن تا یک فایل زیر ۴۸ مگ شود؛ فقط اگر نشد تقسیم کن.
+    # بزرگ بود؛ فقط تقسیم کن (بدون فشرده‌سازی).
     fitted = await _fit_for_bot_api(main, tmpdir, tracker)
     if fitted != [main]:
         return title, fitted, len(fitted) > 1
@@ -1198,10 +1144,10 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
     فرستاده شد. ارسال همیشه با خود ربات (Bot API) است.
     caption_mode: "instagram" → کپشن همه قسمت‌ها «@ربات ❤️»؛
     "title" → کپشن عنوان (قسمت‌ها با شماره قسمت).
-    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول
-    فشرده می‌شوند تا یک فایل زیر ۴۸ مگ شوند و فقط اگر فشرده هم
-    جا نشد تقسیم می‌شوند. ارسال با حساب کاربری (Telethon) فقط
-    وقتی انجام می‌شود که TELETHON_SEND_ENABLED=true باشد."""
+    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ
+    با ffmpeg -c copy (بدون ریکد) تقسیم می‌شوند. ارسال با حساب
+    کاربری (Telethon) فقط وقتی انجام می‌شود که
+    TELETHON_SEND_ENABLED=true باشد."""
     if not files:
         return False
 
@@ -1250,10 +1196,10 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
                 sent = True
                 continue
             logger.warning(
-                "Telethon send failed for %s; falling back to compress/split",
+                "Telethon send failed for %s; falling back to split",
                 path,
             )
-        # فشرده‌سازی بعد تقسیم؛ هر دو فقط با Bot API فرستاده می‌شوند.
+        # تقسیم؛ فقط با Bot API فرستاده می‌شود.
         fitted = await _fit_for_bot_api(path, tmpdir, tracker)
         fitted = [p for p in fitted if p.stat().st_size <= MAX_BYTES]
         if fitted:
@@ -1273,7 +1219,7 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
 async def do_instagram_download(bot, chat_id: int, url: str) -> str:
     """دانلود اینستا. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
     پیام پیشرفت همه فازها را نشان می‌دهد (آماده‌سازی، دانلود،
-    ارسال مستقیم، فشرده‌سازی، تقسیم، آپلود) و هر ۵ ثانیه ویرایش
+    ارسال مستقیم، تقسیم، آپلود) و هر ۵ ثانیه ویرایش
     می‌شود. اول لینک مستقیم امتحان می‌شود؛ اگر نشد دانلود معمولی."""
     tracker = ProgressTracker()
     done = asyncio.Event()
@@ -1295,7 +1241,7 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
                     bot, chat_id, info, 720, caption, None, tracker
                 ):
                     return "ok"
-            # ۲) دانلود معمولی (فرگمنت موازی + فشرده‌سازی)
+            # ۲) دانلود معمولی (فرگمنت موازی)
             try:
                 title, files, was_split = await download_best_effort(
                     url, tmpdir,
@@ -1331,7 +1277,7 @@ async def _watch_progress(bot, chat_id: int, message_id: int,
                           is_photo: bool) -> None:
     """هر ۵ ثانیه پیام پیشرفت را با فاز و درصد فعلی ویرایش می‌کند.
     همه فازها را نشان می‌دهد: آماده‌سازی، دانلود، ارسال مستقیم،
-    فشرده‌سازی، تقسیم و آپلود — با سرعت و ETA هر جا که معلوم باشد."""
+    تقسیم و آپلود — با سرعت و ETA هر جا که معلوم باشد."""
     last_text = ""
     try:
         while not done.is_set():
