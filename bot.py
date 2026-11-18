@@ -11,7 +11,15 @@
   خود ربات (Bot API) است؛ ارسال با حساب کاربری (Telethon/MTProto)
   پیش‌فرض خاموش است و فقط اگر TELETHON_SEND_ENABLED=true ست شده
   باشد استفاده می‌شود.
-- پیام پیشرفت هم درصد دانلود را نشان می‌دهد، هم درصد آپلود.
+- پیام پیشرفت همه فازها را نشان می‌دهد: آماده‌سازی، دانلود،
+  ارسال مستقیم، فشرده‌سازی، تقسیم و آپلود — هر کدام با نوار،
+  درصد، سرعت و ETA؛ هر ۵ ثانیه در همان پیام ویرایش می‌شود.
+- تا ۳ دانلود هم‌زمان؛ دانلود چهارم به بعد توی صف می‌ماند.
+  هر دانلود پوشه، پیام و ترکر خودش را دارد.
+- ارسال سریع پورن‌هاب: اول سعی می‌شود لینک مستقیم mp4 (بدون
+  دانلود روی ریل‌وی) مستقیم به تلگرام فرستاده شود؛ اگر نشد
+  (لینک IP-bound است یا تلگرام نمی‌تواند بگیرد)، مسیر قدیمی
+  دانلود-با-فرگمنت‌های موازی + فشرده‌سازی اجرا می‌شود.
 - دانلودها در پس‌زمینه اجرا می‌شوند تا ربات به دستورهای دیگر
   جواب بدهد.
 - BOT_TOKEN از متغیر محیطی.
@@ -26,6 +34,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from urllib.parse import parse_qs, urlparse
 import uuid
 from pathlib import Path
 
@@ -90,30 +99,82 @@ MAX_BYTES = 48 * 1024 * 1024
 # سقف ارسال فایل با MTProto (حساب کاربری Telethon): ۲ گیگابایت.
 TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
-# فقط یک دانلود هم‌زمان؛ بقیه صف می‌کشند.
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+# حداکثر ۳ دانلود هم‌زمان؛ دانلود چهارم به بعد توی صف می‌ماند و
+# به کاربر گفته می‌شود. هر دانلود پوشه، پیام پیشرفت و ترکر خودش را
+# دارد، پس یک دانلود پورن‌هاب هیچ‌وقت دانلود ریلز کاربر دیگر را
+# بلاک نمی‌کند و ربات هم موقع دانلود به دستورها جواب می‌دهد.
+MAX_CONCURRENT_DOWNLOADS = 3
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+
+def _fmt_speed(bps: float) -> str:
+    """سرعت به شکل خوانا: 512KiB/s یا 1.2MiB/s؛ خالی اگر معلوم نیست."""
+    if not bps or bps <= 0:
+        return ""
+    if bps >= 1024 * 1024:
+        return f"{bps / (1024 * 1024):.1f}MiB/s"
+    if bps >= 1024:
+        return f"{bps / 1024:.0f}KiB/s"
+    return f"{bps:.0f}B/s"
+
+
+def _fmt_eta(seconds: int) -> str:
+    """ETA به شکل mm:ss؛ خالی اگر معلوم نیست."""
+    if not seconds or seconds <= 0:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _bar(pct: int) -> str:
+    pct = max(0, min(100, pct))
+    filled = pct // 10
+    return "▓" * filled + "░" * (10 - filled)
+
+
+# فازهای پیام پیشرفت: (آیکون، برچسب کوتاه)
+_PHASE_META = {
+    "info": ("⏳", "آماده‌سازی"),
+    "download": ("📥", "دانلود"),
+    "direct": ("🔗", "ارسال مستقیم"),
+    "compress": ("🗜️", "فشرده‌سازی"),
+    "split": ("✂️", "تقسیم"),
+    "upload": ("📤", "آپلود"),
+    "done": ("✅", "تمام شد"),
+}
 
 
 class ProgressTracker:
-    """وضعیت دانلود و آپلود؛ هوک yt-dlp و ارسال‌کننده‌ها از توی
-    thread فقط چند عدد را به‌روز می‌کنند و یک تسک جداگانه پیام
-    پیشرفت را ویرایش می‌کند."""
+    """وضعیت همه فازها: آماده‌سازی، دانلود، ارسال مستقیم،
+    فشرده‌سازی، تقسیم، آپلود. هوک yt-dlp و ffmpeg و ارسال‌کننده‌ها
+    از توی thread فقط چند عدد را به‌روز می‌کنند و یک تسک جداگانه
+    پیام پیشرفت را هر ۵ ثانیه ویرایش می‌کند. هیچ فازی ساکت نیست."""
 
     def __init__(self) -> None:
+        self.phase = "info"
+        # درصد فاز فعلی؛ None یعنی درصد عددی ندارد (مثلاً آماده‌سازی).
+        self.phase_percent: int | None = None
         self.downloaded = 0
         self.total = 0
         self.speed = 0.0
         self.eta = 0
         self.started_at = time.monotonic()
-        # فاز فعلی: "download" یا "upload"
-        self.phase = "download"
         self.upload_done_parts = 0
         self.upload_total_parts = 0
         self.upload_bytes = 0
         self.upload_total_bytes = 0
+        self.upload_started_at: float | None = None
+
+    def set_phase(self, phase: str, percent: int | None = None) -> None:
+        self.phase = phase
+        self.phase_percent = percent
 
     def hook(self, d: dict) -> None:
         if d.get("status") == "downloading":
+            self.phase = "download"
             self.downloaded = int(d.get("downloaded_bytes") or 0)
             self.total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
             self.speed = float(d.get("speed") or 0)
@@ -127,14 +188,17 @@ class ProgressTracker:
     def begin_upload(self, total_parts: int, total_bytes: int) -> None:
         """شروع فاز آپلود: درصد از اینجا به بعد درصد آپلود است."""
         self.phase = "upload"
+        self.phase_percent = 0
         self.upload_total_parts = total_parts
         self.upload_done_parts = 0
         self.upload_total_bytes = total_bytes
         self.upload_bytes = 0
+        self.upload_started_at = time.monotonic()
 
     def mark_upload_part_done(self, size: int) -> None:
         self.upload_done_parts += 1
         self.upload_bytes += int(size)
+        self.phase_percent = self.upload_percent()
 
     def upload_percent(self) -> int:
         if self.upload_total_bytes:
@@ -145,23 +209,65 @@ class ProgressTracker:
             )
         return 0
 
+    def _upload_speed(self) -> float:
+        if self.upload_started_at is None or self.upload_bytes <= 0:
+            return 0.0
+        elapsed = time.monotonic() - self.upload_started_at
+        if elapsed <= 0:
+            return 0.0
+        return self.upload_bytes / elapsed
+
+    def _upload_eta(self) -> int:
+        speed = self._upload_speed()
+        if speed <= 0 or not self.upload_total_bytes:
+            return 0
+        remaining = self.upload_total_bytes - self.upload_bytes
+        return max(0, int(remaining / speed))
+
     def display_percent(self) -> int:
         if self.phase == "upload":
             return self.upload_percent()
-        return self.percent()
+        if self.phase == "download":
+            return self.percent()
+        return self.phase_percent if self.phase_percent is not None else 0
 
     def display_text(self) -> str:
-        return _progress_text(self.display_percent(), self.phase)
+        icon, label = _PHASE_META.get(self.phase, ("⏳", ""))
+        if self.phase == "download":
+            pct = self.percent()
+            extra = " • ".join(
+                x for x in (_fmt_speed(self.speed), _fmt_eta(self.eta)) if x
+            )
+            text = f"{icon} {label} {_bar(pct)} {pct}٪"
+            return text + (f" • {extra}" if extra else "")
+        if self.phase == "upload":
+            pct = self.upload_percent()
+            extra = " • ".join(
+                x
+                for x in (
+                    _fmt_speed(self._upload_speed()),
+                    _fmt_eta(self._upload_eta()),
+                )
+                if x
+            )
+            text = f"{icon} {label} {_bar(pct)} {pct}٪"
+            return text + (f" • {extra}" if extra else "")
+        if self.phase in ("compress", "split"):
+            if self.phase_percent is None:
+                return f"{icon} {label}…"
+            pct = self.phase_percent
+            return f"{icon} {label} {_bar(pct)} {pct}٪"
+        if self.phase == "done":
+            return f"{icon} {label}"
+        return f"{icon} {label}…"
 
 
 def _progress_text(pct: int, phase: str = "download") -> str:
-    """متن پیام پیشرفت: نوار لودینگ + درصد. کوتاه.
-    فاز دانلود ⏳ و فاز آپلود 📤 است."""
-    pct = max(0, min(100, pct))
-    filled = pct // 10
-    bar = "▓" * filled + "░" * (10 - filled)
-    icon = "📤" if phase == "upload" else "⏳"
-    return f"{icon} {bar} {pct}٪"
+    """متن اولیه پیام پیشرفت (قبل از اینکه ترکر داده داشته باشد)."""
+    icon, label = _PHASE_META.get(phase, ("⏳", ""))
+    if phase in ("info", "direct"):
+        return f"{icon} {label}…"
+    return f"{icon} {label} {_bar(pct)} {pct}٪"
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +597,12 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
         "fragment_retries": 5,
         "extractor_retries": 3,
         "socket_timeout": 30,
+        # دانلود موازی فرگمنت‌ها: پورن‌هاب هر اتصال را حدود ۵۰۰
+        # کیلوبایت/ثانیه محدود می‌کند (rate=500k توی لینک)، پس
+        # ۸ فرگمنت موازی تا چند برابر سرعت دانلود را بالا می‌برد.
+        # برای فایل mp4 مستقیم هم چانک‌های ۱۰ مگی موازی می‌شود.
+        "concurrent_fragment_downloads": 8,
+        "http_chunk_size": 10 * 1024 * 1024,
         "progress_hooks": [tracker.hook] if tracker is not None else [],
         "http_headers": {
             "User-Agent": CHROME_USER_AGENT,
@@ -541,6 +653,140 @@ def _fetch_info_sync(url: str) -> dict | None:
     except Exception:
         logger.exception("yt-dlp info fetch failed for %s", url)
         return None
+
+
+# ---------------------------------------------------------------------------
+# ارسال مستقیم با لینک (بدون دانلود روی ریل‌وی) — بهترین تلاش
+# ---------------------------------------------------------------------------
+# ایده: اگر yt-dlp یک لینک mp4 مستقیم بدهد که تلگرام خودش بتواند
+# بگیرد، ریل‌وی اصلاً دانلود/آپلود نمی‌کند و ویدیو در چند ثانیه
+# می‌رسد. ولی دو مانع واقعی هست که تست محلی ثابت کرد:
+# - پورن‌هاب: لینک mp4 مستقیم به IP قفل شده
+#   (…&ip=…&ipa=1&hash=…)؛ تلگرام از IP دیگری می‌گیرد و 410 می‌گیرد.
+# - اینستاگرام: CDN حتی به HEAD با impersonation هم 403 می‌دهد و
+#   حجم فایل توی info نیست (None)، پس اندازه معلوم نیست.
+# پس این مسیر فقط وقتی امتحان می‌شود که (۱) فرمت mp4 مستقیم باشد،
+# (۲) لینک به IP قفل نباشد، (۳) حجم معلوم و زیر ۴۸ مگ باشد. اگر هر
+# کدام نبود، بدون معطلی برمی‌گردیم به مسیر دانلود-با-فرگمنت-موازی
+# + فشرده‌سازی؛ اگر هم تلگرام نتوانست بگیرد، همان‌جا fallback می‌شود.
+# لاگ مشخص می‌کند کدام مسیر استفاده شد: "direct-url" یا دلیل skip.
+
+def _is_ip_bound_url(url: str) -> bool:
+    """True اگر لینک به IP استخراج‌کننده قفل شده باشد
+    (پارامترهای ip= و ipa=1 توی کوئری)."""
+    try:
+        params = parse_qs(urlparse(url).query)
+    except Exception:
+        return False
+    if params.get("ipa") == ["1"]:
+        return True
+    return "ip" in params and "hash" in params
+
+
+def _head_content_length_sync(url: str, referer: str) -> int | None:
+    """HEAD با همان استک yt-dlp (impersonation کروم)؛
+    Content-Length را برمی‌گرداند یا None اگر نشد."""
+    try:
+        ydl_opts = _build_ydl_opts(
+            referer, 720, tempfile.gettempdir()
+        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            req = yt_dlp.networking.Request(
+                url, method="HEAD",
+                headers={"Referer": referer},
+            )
+            resp = ydl.urlopen(req)
+            length = resp.headers.get("Content-Length")
+            return int(length) if length else None
+    except Exception:
+        return None
+
+
+def _pick_direct_format(info: dict, max_height: int) -> dict | None:
+    """بهترین فرمت mp4 مستقیم (https) با صدا و تصویر، با ارتفاع
+    حداکثر max_height. فرمت‌های فقط-تصویر (dash ویدیویی) و HLS
+    (m3u8) را نمی‌خواهد؛ چون تلگرام نه صدای جدا می‌خواهد نه m3u8."""
+    best = None
+    for f in info.get("formats") or []:
+        if f.get("protocol") not in ("https", "http"):
+            continue
+        if (f.get("ext") or "").lower() != "mp4":
+            continue
+        if f.get("vcodec") in (None, "none"):
+            continue
+        if f.get("acodec") in (None, "none"):
+            continue
+        height = f.get("height") or 0
+        if height > max_height:
+            continue
+        if best is None or height > (best.get("height") or 0):
+            best = f
+    return best
+
+
+async def _try_direct_url_send(bot, chat_id: int, info: dict,
+                               max_height: int, caption: str | None,
+                               thumb: Path | None,
+                               tracker: ProgressTracker) -> bool:
+    """سعی می‌کند ویدیو را با لینک مستقیم mp4 به تلگرام بفرستد
+    (تلگرام خودش فایل را می‌گیرد؛ ریل‌وی دانلود/آپلود نمی‌کند).
+    True اگر تلگرام قبول کرد؛ False یعنی باید مسیر دانلود اجرا شود.
+    هر دلیل skip/fail توی لاگ می‌آید."""
+    fmt = _pick_direct_format(info, max_height)
+    if fmt is None:
+        logger.info("direct-url skipped: no direct mp4 format with audio")
+        return False
+    url = fmt.get("url") or ""
+    if not url:
+        return False
+    if _is_ip_bound_url(url):
+        logger.info(
+            "direct-url skipped: URL is IP-bound (format %s)",
+            fmt.get("format_id"),
+        )
+        return False
+    platform = detect_platform(info.get("webpage_url") or "")
+    referer = (
+        "https://www.pornhub.com/"
+        if platform == "pornhub"
+        else "https://www.instagram.com/"
+    )
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if not size:
+        size = await asyncio.to_thread(
+            _head_content_length_sync, url, referer
+        )
+    if not size or int(size) > MAX_BYTES:
+        logger.info(
+            "direct-url skipped: size unknown or >48MB (format %s, size %s)",
+            fmt.get("format_id"), size,
+        )
+        return False
+    tracker.set_phase("direct")
+    try:
+        thumb_f = None
+        if thumb is not None and thumb.is_file():
+            thumb_f = open(thumb, "rb")
+        try:
+            await bot.send_video(
+                chat_id=chat_id, video=url, caption=caption,
+                supports_streaming=True, thumbnail=thumb_f,
+            )
+        finally:
+            if thumb_f is not None:
+                thumb_f.close()
+        logger.info(
+            "direct-url send OK: format %s (%d bytes)",
+            fmt.get("format_id"), int(size),
+        )
+        tracker.set_phase("done", 100)
+        return True
+    except Exception:
+        logger.exception(
+            "direct-url send failed (format %s); falling back to download",
+            fmt.get("format_id"),
+        )
+        return False
 
 
 def _download_cover_sync(thumb_url: str | None, tmpdir: str) -> Path | None:
@@ -650,8 +896,45 @@ def _probe_duration_seconds(path: Path) -> float | None:
         return None
 
 
-def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
-    """ویدیو را با ffmpeg به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند (بدون ریکد)."""
+def _run_ffmpeg_progress(args: list[str], duration_s: float | None,
+                         tracker: ProgressTracker | None,
+                         phase: str) -> int:
+    """ffmpeg را با ‎-progress اجرا می‌کند و درصد واقعی را توی ترکر
+    می‌نویسد (از out_time_ms نسبت به مدت ویدیو). args دستور کامل
+    ffmpeg است که آخرین عنصرش فایل خروجی است؛ ‎-progress قبل از
+    خروجی اضافه می‌شود. کد بازگشت ffmpeg را برمی‌گرداند."""
+    cmd = list(args[:-1]) + ["-progress", "pipe:1", "-nostats", args[-1]]
+    if tracker is not None:
+        tracker.set_phase(phase, 0)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        logger.exception("ffmpeg start failed")
+        return 1
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    ms = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                if tracker is not None and duration_s:
+                    pct = min(99, int(ms / 1000 / duration_s * 100))
+                    tracker.set_phase(phase, pct)
+    except Exception:
+        pass
+    return proc.wait()
+
+
+def _split_video_sync(path: Path, workdir: Path,
+                      tracker: ProgressTracker | None = None) -> list[Path]:
+    """ویدیو را با ffmpeg به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند (بدون ریکد).
+    درصد تقسیم توی ترکر می‌آید."""
     size = path.stat().st_size
     if size <= MAX_BYTES:
         return [path]
@@ -671,20 +954,21 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
                 old.unlink()
             except OSError:
                 pass
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(path),
-                    "-c", "copy", "-map", "0",
-                    "-f", "segment", "-segment_time", str(segment_time),
-                    "-reset_timestamps", "1",
-                    pattern,
-                ],
-                capture_output=True, text=True, timeout=600,
-            )
-        except Exception:
-            logger.exception("ffmpeg split failed for %s", path)
-            return [path]
+        rc = _run_ffmpeg_progress(
+            [
+                "ffmpeg", "-y", "-i", str(path),
+                "-c", "copy", "-map", "0",
+                "-f", "segment", "-segment_time", str(segment_time),
+                "-reset_timestamps", "1",
+                pattern,
+            ],
+            duration, tracker, "split",
+        )
+        if rc != 0:
+            # مثل قبل: اگر قسمتی ساخته نشده باشد، با زمان کمتر
+            # دوباره تلاش می‌شود؛ اگر قسمتی ساخته شده باشد، همان
+            # پایین بررسی می‌شود.
+            logger.warning("ffmpeg split rc=%d for %s", rc, path)
 
         parts = sorted(workdir.glob(f"{path.stem}_part*.mp4"))
         parts = [p for p in parts if p.is_file() and p.stat().st_size > 0]
@@ -697,29 +981,35 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
 
 
 def _compress_video_sync(path: Path, workdir: Path, height: int,
-                         crf: int) -> Path | None:
+                         crf: int,
+                         tracker: ProgressTracker | None = None) -> Path | None:
     """ویدیو را با ffmpeg ریکد می‌کند (H.264، preset خیلی سریع،
     صدا AAC ۹۶k). خروجی را برمی‌گرداند فقط اگر از فایل اصلی
-    کوچک‌تر بود؛ وگرنه None. کیفیت تماشایی می‌ماند."""
+    کوچک‌تر بود؛ وگرنه None. کیفیت تماشایی می‌ماند.
+    درصد فشرده‌سازی توی ترکر می‌آید."""
     workdir.mkdir(parents=True, exist_ok=True)
     out = workdir / f"{path.stem}_c{height}.mp4"
-    try:
-        r = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(path),
-                "-vf", f"scale=-2:{height}",
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-crf", str(crf),
-                "-c:a", "aac", "-b:a", "96k",
-                "-movflags", "+faststart", str(out),
-            ],
-            capture_output=True, text=True, timeout=1200,
-        )
-    except Exception:
-        logger.exception("ffmpeg compress failed for %s", path)
+    duration = _probe_duration_seconds(path)
+    rc = _run_ffmpeg_progress(
+        [
+            "ffmpeg", "-y", "-i", str(path),
+            "-vf", f"scale=-2:{height}",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", str(crf),
+            "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart", str(out),
+        ],
+        duration, tracker, "compress",
+    )
+    if rc != 0:
+        logger.warning("ffmpeg compress failed for %s (rc=%d)", path, rc)
+        try:
+            out.unlink()
+        except OSError:
+            pass
         return None
     if (
-        r.returncode == 0 and out.is_file()
+        out.is_file()
         and 0 < out.stat().st_size < path.stat().st_size
     ):
         return out
@@ -730,19 +1020,20 @@ def _compress_video_sync(path: Path, workdir: Path, height: int,
     return None
 
 
-async def _fit_for_bot_api(path: Path, tmpdir: str) -> list[Path]:
+async def _fit_for_bot_api(path: Path, tmpdir: str,
+                           tracker: ProgressTracker | None = None) -> list[Path]:
     """فایل را برای ارسال با Bot API جا می‌کند: اگر زیر ۴۸ مگ است
     همان را برمی‌گرداند؛ وگرنه اول فشرده می‌کند (۴۸۰p با crf 28،
     بعد ۳۶۰p با crf 30) تا یک فایل زیر ۴۸ مگ شود و فقط اگر فشرده
     هم جا نشد تقسیم می‌کند. یک فایل فشرده خیلی سریع‌تر از چند
-    قسمت آپلود می‌شود."""
+    قسمت آپلود می‌شود. درصد فشرده‌سازی/تقسیم توی ترکر می‌آید."""
     if path.stat().st_size <= MAX_BYTES:
         return [path]
     if path.suffix.lower() in VIDEO_EXTS:
         workdir = Path(tmpdir) / f"compress-{path.stem}"
         for height, crf in ((480, 28), (360, 30)):
             compressed = await asyncio.to_thread(
-                _compress_video_sync, path, workdir, height, crf
+                _compress_video_sync, path, workdir, height, crf, tracker
             )
             if compressed is not None and compressed.stat().st_size <= MAX_BYTES:
                 logger.info(
@@ -753,7 +1044,9 @@ async def _fit_for_bot_api(path: Path, tmpdir: str) -> list[Path]:
                 return [compressed]
         logger.info("Compress did not fit %s; splitting", path)
     parts_dir = Path(tmpdir) / f"parts-{path.stem}"
-    parts = await asyncio.to_thread(_split_video_sync, path, parts_dir)
+    parts = await asyncio.to_thread(
+        _split_video_sync, path, parts_dir, tracker
+    )
     if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
         return parts
     return [path]
@@ -827,7 +1120,7 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
     if main.stat().st_size <= MAX_BYTES:
         return title, files, False
     # اول فشرده کن تا یک فایل زیر ۴۸ مگ شود؛ فقط اگر نشد تقسیم کن.
-    fitted = await _fit_for_bot_api(main, tmpdir)
+    fitted = await _fit_for_bot_api(main, tmpdir, tracker)
     if fitted != [main]:
         return title, fitted, len(fitted) > 1
     return title, files, False
@@ -961,7 +1254,7 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
                 path,
             )
         # فشرده‌سازی بعد تقسیم؛ هر دو فقط با Bot API فرستاده می‌شوند.
-        fitted = await _fit_for_bot_api(path, tmpdir)
+        fitted = await _fit_for_bot_api(path, tmpdir, tracker)
         fitted = [p for p in fitted if p.stat().st_size <= MAX_BYTES]
         if fitted:
             part_caps = await build_captions(len(fitted), len(fitted) > 1)
@@ -979,40 +1272,50 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
 
 async def do_instagram_download(bot, chat_id: int, url: str) -> str:
     """دانلود اینستا. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
-    پیام پیشرفت هم درصد دانلود و هم درصد آپلود را نشان می‌دهد."""
+    پیام پیشرفت همه فازها را نشان می‌دهد (آماده‌سازی، دانلود،
+    ارسال مستقیم، فشرده‌سازی، تقسیم، آپلود) و هر ۵ ثانیه ویرایش
+    می‌شود. اول لینک مستقیم امتحان می‌شود؛ اگر نشد دانلود معمولی."""
     tracker = ProgressTracker()
     done = asyncio.Event()
     status = await bot.send_message(
-        chat_id=chat_id, text=_progress_text(0),
+        chat_id=chat_id, text=_progress_text(0, "info"),
     )
     watcher = asyncio.create_task(
-        _watch_pornhub_progress(
+        _watch_progress(
             bot, chat_id, status.message_id, tracker, done, False,
         )
     )
     try:
-        async with DOWNLOAD_SEMAPHORE:
-            with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
-                try:
-                    title, files, was_split = await download_best_effort(
-                        url, tmpdir,
-                        prefer_telethon=telethon_send_enabled(),
-                        tracker=tracker,
-                    )
-                except Exception:
-                    logger.exception("download failed for %s", url)
-                    return "error"
-                if not files:
-                    return "empty"
-                sent = await _deliver(
-                    bot, chat_id, tmpdir, title, files, was_split,
-                    "instagram", tracker=tracker,
-                )
-                if sent:
+        with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
+            # ۱) اطلاعات + تلاش برای ارسال مستقیم با لینک
+            info = await asyncio.to_thread(_fetch_info_sync, url)
+            if info:
+                caption = await instagram_caption(bot)
+                if await _try_direct_url_send(
+                    bot, chat_id, info, 720, caption, None, tracker
+                ):
                     return "ok"
-                if all(p.stat().st_size > MAX_BYTES for p in files):
-                    return "too_big"
+            # ۲) دانلود معمولی (فرگمنت موازی + فشرده‌سازی)
+            try:
+                title, files, was_split = await download_best_effort(
+                    url, tmpdir,
+                    prefer_telethon=telethon_send_enabled(),
+                    tracker=tracker,
+                )
+            except Exception:
+                logger.exception("download failed for %s", url)
+                return "error"
+            if not files:
                 return "empty"
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, files, was_split,
+                "instagram", tracker=tracker,
+            )
+            if sent:
+                return "ok"
+            if all(p.stat().st_size > MAX_BYTES for p in files):
+                return "too_big"
+            return "empty"
     finally:
         done.set()
         watcher.cancel()
@@ -1022,12 +1325,13 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
             pass
 
 
-async def _watch_pornhub_progress(bot, chat_id: int, message_id: int,
-                                  tracker: ProgressTracker,
-                                  done: asyncio.Event,
-                                  is_photo: bool) -> None:
-    """هر ۵ ثانیه پیام پیشرفت را با درصد فعلی ویرایش می‌کند.
-    فاز دانلود ⏳ و فاز آپلود 📤 را نشان می‌دهد."""
+async def _watch_progress(bot, chat_id: int, message_id: int,
+                          tracker: ProgressTracker,
+                          done: asyncio.Event,
+                          is_photo: bool) -> None:
+    """هر ۵ ثانیه پیام پیشرفت را با فاز و درصد فعلی ویرایش می‌کند.
+    همه فازها را نشان می‌دهد: آماده‌سازی، دانلود، ارسال مستقیم،
+    فشرده‌سازی، تقسیم و آپلود — با سرعت و ETA هر جا که معلوم باشد."""
     last_text = ""
     try:
         while not done.is_set():
@@ -1057,105 +1361,147 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
                               height: int) -> str:
     """دانلود پورن‌هاب با کیفیت انتخاب‌شده.
     برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
-    اول اطلاعات + کاور گرفته می‌شود، عکس کاور با نوار پیشرفت
-    فرستاده می‌شود و هر ۵ ثانیه ویرایش می‌شود؛ ویدیو با همان کاور
-    به‌عنوان thumbnail فرستاده می‌شود. اگر دانلود با کیفیت انتخاب‌شده
-    نشد، نردبان کیفیت (probe/720→480→360) به‌عنوان fallback اجرا
-    می‌شود."""
-    async with DOWNLOAD_SEMAPHORE:
-        with tempfile.TemporaryDirectory(prefix="ph-") as tmpdir:
-            tracker = ProgressTracker()
-            done = asyncio.Event()
-            progress_msg = None
-            is_photo = False
-            watcher = None
-            try:
-                # ۱) اطلاعات + کاور (بدون دانلود ویدیو)
-                info = await asyncio.to_thread(_fetch_info_sync, url)
-                title = str((info or {}).get("title") or "")
-                cover = None
-                if info:
-                    cover = await asyncio.to_thread(
-                        _download_cover_sync, info.get("thumbnail"), tmpdir
-                    )
+    پیام پیشرفت از همان ثانیه اول (فاز آماده‌سازی) هست و همه
+    فازها را نشان می‌دهد؛ اول اطلاعات + کاور گرفته می‌شود و پیام
+    متنی به عکس کاور تبدیل می‌شود، بعد لینک مستقیم امتحان می‌شود
+    و اگر نشد دانلود با کیفیت انتخاب‌شده شروع می‌شود. اگر دانلود
+    با کیفیت انتخاب‌شده نشد، نردبان کیفیت (probe/720→480→360)
+    به‌عنوان fallback اجرا می‌شود. ویدیو با همان کاور به‌عنوان
+    thumbnail فرستاده می‌شود."""
+    with tempfile.TemporaryDirectory(prefix="ph-") as tmpdir:
+        tracker = ProgressTracker()
+        done = asyncio.Event()
+        progress_msg = None
+        is_photo = False
+        watcher = None
 
-                # ۲) پیام پیشرفت با کاور
+        def _start_watcher() -> None:
+            nonlocal watcher
+            if progress_msg is not None:
+                watcher = asyncio.create_task(
+                    _watch_progress(
+                        bot, chat_id, progress_msg.message_id,
+                        tracker, done, is_photo,
+                    )
+                )
+
+        try:
+            # ۰) پیام پیشرفت از همان اول (فاز آماده‌سازی) تا هیچ
+            # مرحله‌ای ساکت نباشد.
+            try:
+                progress_msg = await bot.send_message(
+                    chat_id=chat_id, text=_progress_text(0, "info"),
+                )
+                _start_watcher()
+            except Exception:
+                progress_msg = None
+                logger.exception("Could not send progress message")
+
+            # ۱) اطلاعات + کاور (بدون دانلود ویدیو)
+            info = await asyncio.to_thread(_fetch_info_sync, url)
+            title = str((info or {}).get("title") or "")
+            cover = None
+            if info:
+                cover = await asyncio.to_thread(
+                    _download_cover_sync, info.get("thumbnail"), tmpdir
+                )
+
+            # ۲) اگر کاور هست، پیام متنی را به عکس کاور تبدیل کن
+            # (همان پیام پیشرفت، فقط با عکس).
+            if cover is not None and progress_msg is not None:
                 try:
-                    if cover is not None:
-                        with open(cover, "rb") as f:
-                            progress_msg = await bot.send_photo(
-                                chat_id=chat_id, photo=f,
-                                caption=_progress_text(0),
-                            )
-                        is_photo = True
-                    else:
-                        progress_msg = await bot.send_message(
-                            chat_id=chat_id, text=_progress_text(0),
+                    if watcher is not None:
+                        watcher.cancel()
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                try:
+                    with open(cover, "rb") as f:
+                        progress_msg = await bot.send_photo(
+                            chat_id=chat_id, photo=f,
+                            caption=tracker.display_text(),
                         )
+                    is_photo = True
+                    _start_watcher()
                 except Exception:
                     progress_msg = None
-                    logger.exception("Could not send progress message")
+                    logger.exception("Could not send cover progress photo")
 
-                if progress_msg is not None:
-                    watcher = asyncio.create_task(
-                        _watch_pornhub_progress(
-                            bot, chat_id, progress_msg.message_id,
-                            tracker, done, is_photo,
-                        )
-                    )
-
-                # ۳) دانلود با کیفیت انتخاب‌شده
-                files: list[Path] = []
-                was_split = False
-                subdir = Path(tmpdir) / f"h{height}"
-                subdir.mkdir(parents=True, exist_ok=True)
-                try:
-                    dl_title, files = await asyncio.to_thread(
-                        _download_once, url, height, str(subdir), tracker
-                    )
-                    if dl_title:
-                        title = dl_title
-                except Exception:
-                    logger.exception(
-                        "yt-dlp failed at %dp for %s", height, url
-                    )
-                    files = []
-
-                # ۴) اگر نشد، fallback به نردبان کیفیت
-                if not files:
-                    title, files, was_split = await download_best_effort(
-                        url, tmpdir,
-                        prefer_telethon=telethon_send_enabled(),
-                        tracker=tracker,
-                    )
-                    if not files:
-                        return "error"
-
-                # ۵) ارسال (ویدیو با کاور)
-                sent = await _deliver(
-                    bot, chat_id, tmpdir, title, files, was_split,
-                    "title", thumb=cover, tracker=tracker,
-                )
-                if sent:
+            # ۲٫۵) اول لینک مستقیم امتحان می‌شود (بدون دانلود روی
+            # ریل‌وی)؛ اگر نشد می‌رویم سراغ دانلود معمولی.
+            if info:
+                if await _try_direct_url_send(
+                    bot, chat_id, info, height,
+                    title[:200] if title else None, cover, tracker,
+                ):
                     return "ok"
-                if all(p.stat().st_size > MAX_BYTES for p in files):
-                    return "too_big"
-                return "empty"
-            finally:
-                done.set()
-                if watcher is not None:
-                    watcher.cancel()
-                if progress_msg is not None:
-                    try:
-                        await progress_msg.delete()
-                    except Exception:
-                        pass
+
+            # ۳) دانلود با کیفیت انتخاب‌شده
+            files: list[Path] = []
+            was_split = False
+            subdir = Path(tmpdir) / f"h{height}"
+            subdir.mkdir(parents=True, exist_ok=True)
+            try:
+                dl_title, files = await asyncio.to_thread(
+                    _download_once, url, height, str(subdir), tracker
+                )
+                if dl_title:
+                    title = dl_title
+            except Exception:
+                logger.exception(
+                    "yt-dlp failed at %dp for %s", height, url
+                )
+                files = []
+
+            # ۴) اگر نشد، fallback به نردبان کیفیت
+            if not files:
+                title, files, was_split = await download_best_effort(
+                    url, tmpdir,
+                    prefer_telethon=telethon_send_enabled(),
+                    tracker=tracker,
+                )
+                if not files:
+                    return "error"
+
+            # ۵) ارسال (ویدیو با کاور)
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, files, was_split,
+                "title", thumb=cover, tracker=tracker,
+            )
+            if sent:
+                return "ok"
+            if all(p.stat().st_size > MAX_BYTES for p in files):
+                return "too_big"
+            return "empty"
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
 
 
 async def _background_download(bot, chat_id: int, url: str,
                                platform: str, height: int | None = None) -> None:
     """دانلود را در پس‌زمینه اجرا می‌کند تا هندلر فوراً برگردد و
-    ربات به دستورهای دیگر جواب بدهد. پیام خطا را خودش می‌فرستد."""
+    ربات به دستورهای دیگر جواب بدهد. پیام خطا را خودش می‌فرستد.
+    تا ۳ دانلود هم‌زمان؛ اگر هر ۳ اسلات پر بود، به کاربر می‌گوید
+    توی صف مانده و بعد که نوبت شد دانلود شروع می‌شود. هر دانلود
+    پوشه، پیام و ترکر خودش را دارد."""
+    acquired = False
+    try:
+        await asyncio.wait_for(DOWNLOAD_SEMAPHORE.acquire(), timeout=1.0)
+        acquired = True
+    except asyncio.TimeoutError:
+        try:
+            await bot.send_message(chat_id=chat_id, text="تو صف موندی… ⏳")
+        except Exception:
+            pass
+        await DOWNLOAD_SEMAPHORE.acquire()
+        acquired = True
     try:
         if platform == "pornhub":
             result = await do_pornhub_download(bot, chat_id, url, height or 720)
@@ -1164,6 +1510,9 @@ async def _background_download(bot, chat_id: int, url: str,
     except Exception:
         logger.exception("download task failed for %s", url)
         result = "error"
+    finally:
+        if acquired:
+            DOWNLOAD_SEMAPHORE.release()
     try:
         if result == "too_big":
             await bot.send_message(chat_id=chat_id, text=TOO_BIG_TEXT)
