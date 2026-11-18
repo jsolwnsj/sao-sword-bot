@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-دانلودر تلگرام — اینستاگرام + پورن‌هاب
-- هم توی پی‌وی کار می‌کند، هم توی گروه (به شرطی که Privacy Mode ربات خاموش باشد).
-- لینک اینستاگرام (ریلز/پست عمومی) یا پورن‌هاب را می‌گیرد،
-  با yt-dlp دانلود می‌کند و همان‌جا توی همان چت برمی‌گرداند.
-- فقط محتوای عمومی. yt-dlp با impersonation مرورگر کروم کار می‌کند
-  تا پورن‌هاب درخواست را با 403 رد نکند؛ اگر باز هم 403 داد،
-  کوکی‌های اختیاری پورن‌هاب (فایل /data/cookies.txt یا متغیر
-  PORNHUB_COOKIES) به yt-dlp داده می‌شوند (بخش کوکی در README).
-- یوتیوب توی این نسخه نیست.
-- محدودیت تلگرام: سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات است و
-  با «مستقیم فرستادن» دور زده نمی‌شود. ربات اول کیفیت را پایین می‌آورد
-  (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و اگر باز هم فایل بالای ۵۰ مگ بود،
-  با ffmpeg آن را به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند و قسمت‌ها را
-  به ترتیب می‌فرستد.
-- راه دوم برای فایل بزرگ (اختیاری): MTProto با Telethon. اگر
-  TELETHON_API_ID و TELETHON_API_HASH ست باشند و سشن هم از یکی از
-  این سه جا بیاید — متغیر TELETHON_SESSION_STRING، فایل
-  /data/telethon_session.txt (روی Volume ریل‌وی) یا ساخته‌شده با
-  دستور /makesession توی پی‌وی — فایل بزرگ (تا ۲ گیگابایت) مستقیم
-  با حساب کاربری تلگرام فرستاده می‌شود و نیازی به تیکه‌تیکه کردن
-  نیست. اگر سشن نباشد، همان مسیر پایین آوردن کیفیت + تقسیم استفاده
-  می‌شود.
-- توکن از متغیر محیطی BOT_TOKEN خوانده می‌شود؛ هیچ‌وقت اینجا هاردکد نکن.
-- روش اجرا: polling — نیازی به دامین و وب‌هوک نیست.
+دانلودر تلگرام — اینستاگرام + پورن‌هاب (یوتیوب ندارد).
+- پی‌وی و گروه.
+- اینستا: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
+- پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
+  پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
+- فایل بزرگ: یک سشن مشترک Telethon برای همه کاربرها
+  (/data/telethon_session.txt یا TELETHON_SESSION_STRING) → تا ۲ گیگ
+  با MTProto؛ اگر نباشد، تقسیم با ffmpeg.
+- دانلودها در پس‌زمینه اجرا می‌شوند تا ربات به دستورهای دیگر
+  جواب بدهد.
+- BOT_TOKEN از متغیر محیطی.
 """
 
 import asyncio
@@ -34,12 +21,16 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import yt_dlp
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -47,8 +38,7 @@ from telegram.ext import (
 )
 
 # Telethon به‌صورت lazy وارد می‌شود تا اگر نصب نبود، ربات باز هم
-# با مسیر معمولی Bot API کار کند. اگر telethon نصب باشد و متغیرهای
-# محیطی‌اش ست شده باشند، مسیر MTProto فعال می‌شود.
+# با مسیر معمولی Bot API کار کند.
 try:
     from telethon import TelegramClient
     from telethon.errors import SessionPasswordNeededError
@@ -64,9 +54,7 @@ except ImportError:  # pragma: no cover - telethon not installed
     TELETHON_AVAILABLE = False
 
 # curl-cffi برای impersonation مرورگر در yt-dlp لازم است؛ اگر نصب نباشد،
-# yt-dlp بدون impersonation کار می‌کند (فقط هدرها و ری‌ترای‌ها اعمال
-# می‌شوند) و دانلود ادامه پیدا می‌کند — ولی پورن‌هاب ممکن است با 403
-# ردش کند.
+# yt-dlp بدون impersonation کار می‌کند و پورن‌هاب ممکن است با 403 ردش کند.
 try:
     import curl_cffi  # noqa: F401
     CURL_CFFI_AVAILABLE = True
@@ -74,9 +62,7 @@ except ImportError:  # pragma: no cover - curl-cffi not installed
     CURL_CFFI_AVAILABLE = False
 
 # yt-dlp از طریق Python API انتظار یک شیء ImpersonateTarget دارد؛
-# دادن رشته "chrome" در نسخه‌های جدید باعث AssertionError توی
-# YoutubeDL.__init__ می‌شود (CLI خودش رشته را تبدیل می‌کند، ولی API
-# نه). اگر ساخت آن نشد، impersonation خاموش می‌ماند.
+# دادن رشته "chrome" باعث AssertionError می‌شود.
 try:
     from yt_dlp.networking.impersonate import (
         ImpersonateTarget as _ImpersonateTarget,
@@ -95,19 +81,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger("downloader-bot")
 
-# سقف سخت تلگرام برای ارسال فایل با ربات: ۵۰ مگابایت.
-# با کمی حاشیه امن، ۴۸ مگابایت می‌گیریم.
+# سقف ارسال فایل با Bot API: ۵۰ مگابایت؛ با حاشیه امن ۴۸ مگ می‌گیریم.
 MAX_BYTES = 48 * 1024 * 1024
 
 # سقف ارسال فایل با MTProto (حساب کاربری Telethon): ۲ گیگابایت.
 TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
+# فقط یک دانلود هم‌زمان؛ بقیه صف می‌کشند.
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 
-# سشن Telethon از سه جا می‌تواند بیاید (به ترتیب اولویت):
-# ۱) حافظه — ساخته‌شده با /makesession، بدون نیاز به ری‌استارت
+
+class ProgressTracker:
+    """وضعیت دانلود yt-dlp؛ هوک از توی thread فقط چند عدد را به‌روز
+    می‌کند و یک تسک جداگانه پیام پیشرفت را ویرایش می‌کند."""
+
+    def __init__(self) -> None:
+        self.downloaded = 0
+        self.total = 0
+        self.speed = 0.0
+        self.eta = 0
+        self.started_at = time.monotonic()
+
+    def hook(self, d: dict) -> None:
+        if d.get("status") == "downloading":
+            self.downloaded = int(d.get("downloaded_bytes") or 0)
+            self.total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+            self.speed = float(d.get("speed") or 0)
+            self.eta = int(d.get("eta") or 0)
+
+    def percent(self) -> int:
+        if not self.total:
+            return 0
+        return min(100, self.downloaded * 100 // self.total)
+
+
+def _progress_text(pct: int) -> str:
+    """متن پیام پیشرفت: نوار لودینگ + درصد. کوتاه."""
+    pct = max(0, min(100, pct))
+    filled = pct // 10
+    bar = "▓" * filled + "░" * (10 - filled)
+    return f"⏳ {bar} {pct}٪"
+
+
+# ---------------------------------------------------------------------------
+# سشن مشترک Telethon — یکی برای همه کاربرها
+# ---------------------------------------------------------------------------
+# سشن از سه جا می‌تواند بیاید (به ترتیب اولویت):
+# ۱) حافظه — ساخته‌شده با /makesession
 # ۲) متغیر محیطی TELETHON_SESSION_STRING
-# ۳) فایل /data/telethon_session.txt روی Volume ریل‌وی (بعد از ری‌استارت هم می‌ماند)
-# مسیر فایل با TELETHON_SESSION_FILE قابل تغییر است (پیش‌فرض /data/telethon_session.txt).
+# ۳) فایل /data/telethon_session.txt روی Volume ریل‌وی
+# سشن مال یک نفر نیست؛ هر کسی /makesession را بزند، همین یک سشن
+# مشترک را می‌سازد/جایگزین می‌کند و همه کاربرها از همان استفاده می‌کنند.
 TELETHON_SESSION_FILE = Path(
     os.environ.get("TELETHON_SESSION_FILE", "/data/telethon_session.txt")
 )
@@ -115,7 +139,7 @@ _RUNTIME_SESSION_STRING: str | None = None
 
 
 def get_telethon_session_string() -> str:
-    """رشته سشن Telethon؛ خالی اگر هیچ‌جا نباشد."""
+    """رشته سشن مشترک Telethon؛ خالی اگر هیچ‌جا نباشد."""
     if _RUNTIME_SESSION_STRING:
         return _RUNTIME_SESSION_STRING
     env_session = os.environ.get("TELETHON_SESSION_STRING", "").strip()
@@ -144,7 +168,7 @@ def _telethon_api_credentials() -> tuple[int, str] | None:
 
 
 def _save_telethon_session(session_str: str) -> bool:
-    """سشن را توی حافظه و فایل ذخیره می‌کند.
+    """سشن مشترک را توی حافظه و فایل ذخیره می‌کند.
     True اگر فایل هم ذخیره شد، False اگر فقط حافظه شد."""
     global _RUNTIME_SESSION_STRING
     _RUNTIME_SESSION_STRING = session_str
@@ -158,8 +182,8 @@ def _save_telethon_session(session_str: str) -> bool:
 
 
 def telethon_configured() -> bool:
-    """True اگر API ID/Hash ست باشند و سشن از حافظه، متغیر محیطی
-    یا فایل /data/telethon_session.txt بیاید و کتابخانه نصب باشد."""
+    """True اگر API ID/Hash ست باشند و سشن مشترک از حافظه، متغیر
+    محیطی یا فایل بیاید و کتابخانه نصب باشد."""
     if not TELETHON_AVAILABLE:
         return False
     if _telethon_api_credentials() is None:
@@ -167,14 +191,14 @@ def telethon_configured() -> bool:
     return bool(get_telethon_session_string())
 
 
-async def send_via_telethon(chat_id: int, path: Path, caption: str | None) -> bool:
+async def send_via_telethon(chat_id: int, path: Path, caption: str | None,
+                            thumb: str | None = None) -> bool:
     """
-    فایل را با MTProto (حساب کاربری Telethon) به همان چت می‌فرستد.
-    سقف ۲ گیگابایت است و سقف ۵۰ مگ Bot API را ندارد.
-    در صورت هر خطایی False برمی‌گرداند تا مسیر تقسیم استفاده شود.
-    نکته: حساب کاربری Telethon باید عضو گروه باشد (برای ارسال به گروه)
-    یا با گیرنده دیالوگ داشته باشد (برای پی‌وی)؛ در غیر این صورت
-    ارسال ناموفق می‌شود و False برمی‌گردد.
+    فایل را با MTProto (حساب کاربری، سشن مشترک) به همان چت می‌فرستد.
+    سقف ۲ گیگابایت. در صورت هر خطایی False برمی‌گرداند تا مسیر
+    تقسیم استفاده شود.
+    نکته: حساب کاربری باید عضو گروه باشد (برای ارسال به گروه) یا با
+    گیرنده دیالوگ داشته باشد (برای پی‌وی).
     """
     if not telethon_configured():
         return False
@@ -193,11 +217,14 @@ async def send_via_telethon(chat_id: int, path: Path, caption: str | None) -> bo
         if not await client.is_user_authorized():
             logger.warning("Telethon session is not authorized.")
             return False
+        kwargs = {"supports_streaming": True}
+        if thumb:
+            kwargs["thumb"] = thumb
         await client.send_file(
             chat_id,
             str(path),
             caption=caption,
-            supports_streaming=True,
+            **kwargs,
         )
         logger.info(
             "Sent %s (%d bytes) via Telethon MTProto to %s",
@@ -220,47 +247,38 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
 START_TEXT = """سلام! 👋
-من دانلودر اینستا و پورن‌هابم.
+لینک اینستاگرام یا پورن‌هاب رو بفرست تا دانلودش کنم.
+برای پورن‌هاب، بعد از فرستادن لینک کیفیت رو انتخاب می‌کنی.
+/makesession — برای فایل‌های بزرگ (فقط پی‌وی)"""
 
-کافیه لینک رو بفرستی:
-• لینک ریلز یا پست اینستاگرام
-• لینک ویدیوی پورن‌هاب
+TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
 
-من دانلودش می‌کنم و همین‌جا برات می‌فرستم.
-
-نکته‌ها:
-• فقط محتوای عمومی دانلود می‌شه؛ محتوای خصوصی و نیازمند لاگین، توی این نسخه نیست.
-• یوتیوب توی این نسخه نیست.
-• تلگرام سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات داره و با «مستقیم فرستادن» دور زده نمی‌شه. من اول کیفیت رو پایین می‌آرم (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p). اگه فایل باز هم بزرگ بود، اگه ارسال با MTProto (Telethon) فعال باشه، مستقیم تا ۲ گیگابایت فرستاده می‌شه؛ اگه فعال نباشه، تیکه‌تیکه‌ش می‌کنم و قسمت‌ها رو به ترتیب می‌فرستم. پس ویدیوهای خیلی طولانی ممکنه چند قسمت بشن.
-• توی گروه هم کار می‌کنم، فقط باید Privacy Mode ربات خاموش باشه (تو BotFather با /setprivacy).
-• برای فعال کردن ارسال فایل بزرگ (MTProto)، توی پی‌وی /makesession رو بزن و شماره و کد رو بده؛ نیازی به ترمینال نیست.
-
-دستورها:
-/start — همین راهنما
-/help — همین راهنما
-/makesession — ساخت سشن Telethon با چت (فقط پی‌وی)؛ برای فعال کردن ارسال فایل بزرگ با MTProto
-"""
-
-TOO_BIG_TEXT = (
-    "این ویدیو حتی بعد از کم کردن کیفیت و تیکه‌تیکه کردن هم "
-    "برای تلگرام خیلی بزرگه. 😕\n"
-    "یه لینک کوتاه‌تر رو امتحان کن."
-)
-
-ERROR_TEXT = (
-    "نتونستم دانلودش کنم. 😕\n"
-    "لینک رو چک کن که عمومی باشه و دوباره بفرست."
-    "\nاگه باز هم نشد، شاید اینستا یا پورن‌هاب موقتاً جلوش رو گرفته."
-)
+ERROR_TEXT = "نشد دانلودش کنم. 😕"
 
 
 def help_text() -> str:
-    """متن راهنما + وضعیت مسیر MTProto (فعال/غیرفعال)."""
-    if telethon_configured():
-        status = "\nارسال فایل بزرگ (MTProto) فعال است؛ ویدیوهای بزرگ تا ۲ گیگابایت مستقیم فرستاده می‌شوند."
-    else:
-        status = "\nارسال فایل بزرگ (MTProto) فعال نیست؛ ویدیوهای بزرگ تیکه‌تیکه می‌شوند."
-    return START_TEXT + status
+    return START_TEXT
+
+
+# یوزرنیم ربات (برای کپشن اینستا)؛ یک بار گرفته و کش می‌شود.
+_BOT_USERNAME: str | None = None
+
+
+async def instagram_caption(bot) -> str:
+    """کپشن ویدیوهای اینستا: فقط آیدی ربات + قلب."""
+    global _BOT_USERNAME
+    if _BOT_USERNAME is None:
+        username = getattr(bot, "username", None)
+        if not username:
+            try:
+                me = await bot.get_me()
+                username = me.username
+            except Exception:
+                username = None
+        _BOT_USERNAME = username or ""
+    if _BOT_USERNAME:
+        return f"@{_BOT_USERNAME} ❤️"
+    return "❤️"
 
 
 # ---------------------------------------------------------------------------
@@ -291,17 +309,11 @@ def detect_platform(url: str) -> str | None:
 # دانلود با yt-dlp (بلوک‌کننده است؛ توی thread اجرا می‌شود)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# کوکی‌های اختیاری پورن‌هاب + تنظیمات yt-dlp (impersonation مرورگر)
-# ---------------------------------------------------------------------------
-
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
 
-# فایل کوکی پورن‌هاب روی Volume ریل‌وی؛ مسیرش با PORNHUB_COOKIES_FILE
-# قابل تغییر است (پیش‌فرض /data/cookies.txt).
 PORNHUB_COOKIES_FILE = Path(
     os.environ.get("PORNHUB_COOKIES_FILE", "/data/cookies.txt")
 )
@@ -310,19 +322,14 @@ _IMPERSONATION_WARNING_LOGGED = False
 
 def get_pornhub_cookiefile() -> str | None:
     """مسیر فایل کوکی پورن‌هاب؛ None اگر چیزی نباشد.
-    اولویت:
-    ۱) متغیر PORNHUB_COOKIES — اگر مسیر یک فایل موجود باشد همان را
-       می‌دهد؛ اگر متن خام فایل کوکی (فرمت Netscape، با سطرهای
-       pornhub.com) باشد، آن را توی /data/pornhub_cookies.txt
-       می‌نویسد (یا اگر /data قابل نوشتن نبود، توی یک فایل موقت).
-    ۲) فایل /data/cookies.txt روی Volume ریل‌وی.
+    اولویت: متغیر PORNHUB_COOKIES (مسیر فایل یا متن خام فایل کوکی)،
+    بعد فایل /data/cookies.txt روی Volume ریل‌وی.
     کوکی فقط برای پورن‌هاب استفاده می‌شود، نه اینستاگرام."""
     env_value = os.environ.get("PORNHUB_COOKIES", "").strip()
     if env_value:
         if os.path.isfile(env_value):
             return env_value
         if "\n" in env_value and "pornhub.com" in env_value:
-            # متن خام فایل کوکی توی متغیر گذاشته شده؛ ذخیره‌اش کن.
             try:
                 target = Path("/data/pornhub_cookies.txt")
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -351,12 +358,8 @@ def get_pornhub_cookiefile() -> str | None:
     return None
 
 
-def _build_ydl_opts(url: str, height: int, outdir: str) -> dict:
-    """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای.
-    پورن‌هاب درخواست‌هایی که شبیه ربات‌اند (مثل IP دیتاسنتر ریل‌وی)
-    را با 403 رد می‌کند؛ impersonation با curl-cffi اثر انگشت TLS و
-    هدرهای مرورگر کروم را تقلید می‌کند. اگر curl-cffi نصب نباشد،
-    فقط هدرها و ری‌ترای‌ها اعمال می‌شوند و دانلود ادامه پیدا می‌کند."""
+def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
+    """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای."""
     global _IMPERSONATION_WARNING_LOGGED
     platform = detect_platform(url)
     if platform == "pornhub":
@@ -377,12 +380,11 @@ def _build_ydl_opts(url: str, height: int, outdir: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        # چند بار تلاش با فاصله؛ بلاک موقت (403/410) گاهی با تلاش
-        # دوباره رد می‌شود.
         "retries": 5,
         "fragment_retries": 5,
         "extractor_retries": 3,
         "socket_timeout": 30,
+        "progress_hooks": [tracker.hook] if tracker is not None else [],
         "http_headers": {
             "User-Agent": CHROME_USER_AGENT,
             "Accept": (
@@ -413,9 +415,90 @@ def _build_ydl_opts(url: str, height: int, outdir: str) -> dict:
     return ydl_opts
 
 
-def _download_once(url: str, height: int, outdir: str) -> tuple[str, list[Path]]:
+def _fetch_info_sync(url: str) -> dict | None:
+    """اطلاعات ویدیو بدون دانلود فایل (عنوان + آدرس کاور)."""
+    try:
+        ydl_opts = _build_ydl_opts(url, 720, tempfile.gettempdir())
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return info if isinstance(info, dict) else None
+    except Exception:
+        logger.exception("yt-dlp info fetch failed for %s", url)
+        return None
+
+
+def _download_cover_sync(thumb_url: str | None, tmpdir: str) -> Path | None:
+    """کاور ویدیو را دانلود می‌کند و به JPG تبدیل می‌کند (اگر webp/png
+    بود). None اگر نشد."""
+    if not thumb_url:
+        return None
+    try:
+        req = urllib.request.Request(
+            thumb_url,
+            headers={
+                "User-Agent": CHROME_USER_AGENT,
+                "Referer": "https://www.pornhub.com/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+            ctype = ""
+            try:
+                ctype = resp.headers.get_content_type()
+            except Exception:
+                pass
+        if not data:
+            return None
+        low = thumb_url.lower().split("?")[0]
+        needs_convert = (
+            low.endswith(".webp") or low.endswith(".png")
+            or ctype in ("image/webp", "image/png")
+        )
+        if needs_convert:
+            raw_ext = ".webp" if "webp" in (low + ctype) else ".png"
+            raw = Path(tmpdir) / f"cover{raw_ext}"
+            raw.write_bytes(data)
+            jpg = Path(tmpdir) / "cover.jpg"
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(raw), str(jpg)],
+                capture_output=True, timeout=60,
+            )
+            if r.returncode == 0 and jpg.is_file() and jpg.stat().st_size > 0:
+                return jpg
+            return None
+        path = Path(tmpdir) / "cover.jpg"
+        path.write_bytes(data)
+        return path if path.stat().st_size > 0 else None
+    except Exception:
+        logger.exception("Cover download failed")
+        return None
+
+
+def _probe_height_sync(url: str) -> int | None:
+    """بدون دانلود فایل، حجم تقریبی هر کیفیت را می‌پرسد و بالاترین
+    کیفیتی که زیر ۴۸ مگ جا می‌شود را برمی‌گرداند. None یعنی حجم
+    معلوم نشد."""
+    for height in (720, 480, 360):
+        try:
+            ydl_opts = _build_ydl_opts(url, height, tempfile.gettempdir())
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            logger.exception("yt-dlp probe failed at %dp for %s", height, url)
+            return None
+        if not isinstance(info, dict):
+            return None
+        size = info.get("filesize") or info.get("filesize_approx")
+        if not size:
+            return None
+        if int(size) <= MAX_BYTES:
+            return height
+    return 360
+
+
+def _download_once(url: str, height: int, outdir: str, tracker=None) -> tuple[str, list[Path]]:
     """یک بار دانلود با سقف کیفیت height. برمی‌گرداند: (عنوان، فهرست فایل‌ها)."""
-    ydl_opts = _build_ydl_opts(url, height, outdir)
+    ydl_opts = _build_ydl_opts(url, height, outdir, tracker=tracker)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -459,7 +542,6 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
 
     duration = _probe_duration_seconds(path)
     if duration and duration > 0:
-        # زمان هر قسمت: طوری که حجم هر قسمت زیر ۴۸ مگ بماند (۸٪ حاشیه امن).
         segment_time = max(30, int(duration * MAX_BYTES * 0.92 / size))
     else:
         segment_time = 300
@@ -468,7 +550,6 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
 
     for _attempt in range(3):
         pattern = str(workdir / f"{path.stem}_part%03d.mp4")
-        # فایل‌های قسمت قبلی را پاک کن تا با تلاش جدید قاطی نشوند.
         for old in workdir.glob(f"{path.stem}_part*.mp4"):
             try:
                 old.unlink()
@@ -493,54 +574,68 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
         parts = [p for p in parts if p.is_file() and p.stat().st_size > 0]
         if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
             return parts
-        if len(parts) <= 1:
-            # تقسیم نشد (مثلاً ویدیوی خیلی کوتاه با بیت‌ریت بالا)؛
-            # زمان قسمت را نصف کن و دوباره امتحان کن.
-            segment_time = max(15, segment_time // 2)
-            continue
-        # بعضی قسمت‌ها هنوز بزرگ‌اند؛ زمان را نصف کن و دوباره تقسیم کن.
         segment_time = max(15, segment_time // 2)
 
-    # آخرین تلاش: هرچه هست را برگردان؛ فرستنده قسمت‌های بزرگ را رد می‌کند.
     parts = sorted(workdir.glob(f"{path.stem}_part*.mp4"))
     return [p for p in parts if p.is_file() and p.stat().st_size > 0] or [path]
 
 
-async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = False):
+async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = False,
+                               tracker=None):
     """
-    دانلود با پایین آوردن کیفیت (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و در صورت نیاز
-    تقسیم به قسمت‌ها.
+    دانلود با کیفیتی که از قبل اندازه‌اش معلوم شده (probe).
     برمی‌گرداند: (title, files, was_split)
-
-    اگر prefer_telethon=True باشد (یعنی MTProto فعال است)، به‌جای تقسیم،
-    فایل باکیفیت‌ترین دانلود (۷۲۰p) برگردانده می‌شود تا فرستنده اول
-    Telethon را امتحان کند؛ تقسیم فقط وقتی انجام می‌شود که Telethon
-    نباشد یا ناموفق باشد (فرستنده خودش آن را انجام می‌دهد).
+    اگر حجم معلوم نشد، حلقه قدیمی (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) به‌عنوان
+    fallback می‌ماند. اگر prefer_telethon=True باشد، مستقیم ۷۲۰p
+    دانلود می‌شود تا اول Telethon امتحان شود.
     """
-    best_candidate: tuple[str, list[Path]] | None = None
-    results: dict[int, tuple[str, list[Path]]] = {}
+    if prefer_telethon:
+        subdir = Path(tmpdir) / "h720"
+        subdir.mkdir(parents=True, exist_ok=True)
+        try:
+            title, files = await asyncio.to_thread(
+                _download_once, url, 720, str(subdir), tracker
+            )
+        except Exception:
+            logger.exception("yt-dlp failed at 720p for %s", url)
+            return "", [], False
+        return title, files, False
 
+    probe_height = await asyncio.to_thread(_probe_height_sync, url)
+    if probe_height is not None:
+        logger.info("Probe chose %dp for %s", probe_height, url)
+        subdir = Path(tmpdir) / f"h{probe_height}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        try:
+            title, files = await asyncio.to_thread(
+                _download_once, url, probe_height, str(subdir), tracker
+            )
+        except Exception:
+            logger.exception(
+                "yt-dlp failed at %dp for %s", probe_height, url
+            )
+            return "", [], False
+        if not files:
+            return "", [], False
+        return title, files, False
+
+    logger.info("Probe gave no size for %s; falling back to 720→480→360", url)
+    best_candidate: tuple[str, list[Path]] | None = None
     for height in (720, 480, 360):
         subdir = Path(tmpdir) / f"h{height}"
         subdir.mkdir(parents=True, exist_ok=True)
         try:
             title, files = await asyncio.to_thread(
-                _download_once, url, height, str(subdir)
+                _download_once, url, height, str(subdir), tracker
             )
         except Exception:
             logger.exception("yt-dlp failed at %dp for %s", height, url)
             continue
         if not files:
             continue
-
-        results[height] = (title, files)
-
-        # فایل اصلی: بزرگ‌ترین فایل دانلودشده.
         main = max(files, key=lambda p: p.stat().st_size)
         if main.stat().st_size <= MAX_BYTES:
             return title, files, False
-
-        # هنوز بزرگ است؛ کوچک‌ترین کاندید را نگه دار و کیفیت را پایین‌تر بیاور.
         if best_candidate is None or main.stat().st_size < max(
             p.stat().st_size for p in best_candidate[1]
         ):
@@ -548,30 +643,14 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
 
     if best_candidate is None:
         return "", [], False
-
     title, files = best_candidate
-
-    # مسیر MTProto: فایل باکیفیت (۷۲۰p) را بدون تقسیم برگردان؛
-    # فرستنده اول Telethon را امتحان می‌کند.
-    if prefer_telethon:
-        if 720 in results:
-            hq_title, hq_files = results[720]
-            return hq_title, hq_files, False
-        return title, files, False
-
     main = max(files, key=lambda p: p.stat().st_size)
-
-    # اگر فایل اصلی ویدیو نیست (مثلاً عکس)، تقسیم معنا ندارد.
     if main.suffix.lower() not in VIDEO_EXTS:
         return title, files, False
-
-    # آخرین چاره: تقسیم به قسمت‌های زیر ۴۸ مگ.
     parts_dir = Path(tmpdir) / "parts"
     parts = await asyncio.to_thread(_split_video_sync, main, parts_dir)
     if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
-        # بقیه فایل‌ها (اگر بود) را کنار بگذار؛ فقط قسمت‌های ویدیو را بفرست.
         return title, parts, True
-
     return title, files, False
 
 
@@ -579,44 +658,47 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
 # ارسال فایل به چت
 # ---------------------------------------------------------------------------
 
-async def send_files(bot, chat_id: int, title: str, files: list[Path],
-                     was_split: bool) -> bool:
-    """فایل‌ها را می‌فرستد. اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند."""
+async def send_files(bot, chat_id: int, files: list[Path],
+                     captions: list | None = None,
+                     thumb: Path | None = None) -> bool:
+    """فایل‌ها را می‌فرستد. captions هم‌طول files است.
+    thumb (کاور) فقط برای اولین ویدیو استفاده می‌شود.
+    اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند."""
     if not files:
         return False
 
+    captions = captions or [None] * len(files)
     sent_any = False
-    total = len(files)
     for i, path in enumerate(files):
-        # سقف سخت ۵۰ مگ تلگرام — با مستقیم فرستادن دور زده نمی‌شود.
         if path.stat().st_size > MAX_BYTES:
             continue
-
-        if was_split and total > 1:
-            caption = f"{title[:150]}\nقسمت {i + 1} از {total}" if title else (
-                f"قسمت {i + 1} از {total}"
-            )
-        else:
-            caption = title[:200] if (i == 0 and title) else None
+        caption = captions[i] if i < len(captions) else None
         ext = path.suffix.lower()
-
         try:
-            with open(path, "rb") as f:
-                if ext == ".mp3":
-                    await bot.send_audio(
-                        chat_id=chat_id, audio=f,
-                        title=title[:100] if title else None,
-                    )
-                elif ext in VIDEO_EXTS:
-                    await bot.send_video(
-                        chat_id=chat_id, video=f,
-                        caption=caption, supports_streaming=True,
-                    )
-                elif ext in (".jpg", ".jpeg", ".png", ".webp"):
+            if ext in VIDEO_EXTS:
+                thumb_f = None
+                if thumb is not None and i == 0 and thumb.is_file():
+                    thumb_f = open(thumb, "rb")
+                try:
+                    with open(path, "rb") as f:
+                        await bot.send_video(
+                            chat_id=chat_id, video=f,
+                            caption=caption, supports_streaming=True,
+                            thumb=thumb_f,
+                        )
+                finally:
+                    if thumb_f is not None:
+                        thumb_f.close()
+            elif ext == ".mp3":
+                with open(path, "rb") as f:
+                    await bot.send_audio(chat_id=chat_id, audio=f)
+            elif ext in (".jpg", ".jpeg", ".png", ".webp"):
+                with open(path, "rb") as f:
                     await bot.send_photo(
                         chat_id=chat_id, photo=f, caption=caption,
                     )
-                else:
+            else:
+                with open(path, "rb") as f:
                     await bot.send_document(
                         chat_id=chat_id, document=f, caption=caption,
                     )
@@ -627,82 +709,339 @@ async def send_files(bot, chat_id: int, title: str, files: list[Path],
     return sent_any
 
 
-async def do_download_and_send(bot, chat_id: int, url: str) -> str:
-    """
-    دانلود و ارسال. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
-    ترتیب ارسال:
-    ۱) فایل زیر ۴۸ مگ: مستقیم با Bot API.
-    ۲) فایل بزرگ‌تر: اگر MTProto (Telethon) فعال باشد، مستقیم تا ۲ گیگ
-       با حساب کاربری فرستاده می‌شود.
-    ۳) اگر Telethon نباشد یا ناموفق باشد: تقسیم به قسمت‌های زیر ۴۸ مگ
-       و ارسال قسمت‌ها با Bot API.
-    """
-    use_telethon = telethon_configured()
-    status = await bot.send_message(
-        chat_id=chat_id, text="⏳ دارم دانلود می‌کنم، یه کم صبر کن..."
-    )
-    try:
-        with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
-            try:
-                title, files, was_split = await download_best_effort(
-                    url, tmpdir, prefer_telethon=use_telethon
+async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
+                   files: list[Path], was_split: bool,
+                   caption_mode: str, thumb: Path | None = None) -> bool:
+    """فایل‌های دانلودشده را می‌فرستد و True برمی‌گرداند اگر چیزی
+    فرستاده شد.
+    caption_mode: "instagram" → کپشن همه قسمت‌ها «@ربات ❤️»؛
+    "title" → کپشن عنوان (قسمت‌ها با شماره قسمت).
+    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول با
+    Telethon (سشن مشترک)، بعد تقسیم با ffmpeg."""
+    if not files:
+        return False
+
+    async def build_captions(n: int, split: bool) -> list:
+        if caption_mode == "instagram":
+            ig = await instagram_caption(bot)
+            return [ig] * n
+        caps = []
+        for i in range(n):
+            if split and n > 1:
+                caps.append(
+                    f"{title[:150]}\nقسمت {i + 1} از {n}" if title
+                    else f"قسمت {i + 1} از {n}"
                 )
-            except Exception:
-                logger.exception("download failed for %s", url)
-                return "error"
+            else:
+                caps.append(title[:200] if (i == 0 and title) else None)
+        return caps
 
-            if not files:
+    small = [p for p in files if p.stat().st_size <= MAX_BYTES]
+    large = [p for p in files if p.stat().st_size > MAX_BYTES]
+    sent = False
+
+    if small:
+        small_caps = [
+            (await build_captions(len(files), was_split))[files.index(p)]
+            for p in small
+        ]
+        sent = await send_files(bot, chat_id, small, small_caps, thumb=thumb)
+
+    for path in large:
+        if path.stat().st_size > TELETHON_MAX_BYTES:
+            continue
+        caps = await build_captions(len(files), was_split)
+        cap = caps[files.index(path)]
+        if telethon_configured():
+            if await send_via_telethon(
+                chat_id, path, cap,
+                thumb=str(thumb) if thumb is not None else None,
+            ):
+                sent = True
+                continue
+            logger.warning(
+                "Telethon send failed for %s; falling back to split",
+                path,
+            )
+        if path.suffix.lower() in VIDEO_EXTS:
+            parts_dir = Path(tmpdir) / f"parts-{path.stem}"
+            parts = await asyncio.to_thread(
+                _split_video_sync, path, parts_dir
+            )
+            if len(parts) > 1 and all(
+                p.stat().st_size <= MAX_BYTES for p in parts
+            ):
+                part_caps = await build_captions(len(parts), True)
+                if await send_files(
+                    bot, chat_id, parts, part_caps, thumb=thumb
+                ):
+                    sent = True
+                continue
+
+    return sent
+
+
+# ---------------------------------------------------------------------------
+# دانلود اینستاگرام و پورن‌هاب (در پس‌زمینه اجرا می‌شوند)
+# ---------------------------------------------------------------------------
+
+async def do_instagram_download(bot, chat_id: int, url: str) -> str:
+    """دانلود اینستا. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'"""
+    status = await bot.send_message(chat_id=chat_id, text="⏳")
+    try:
+        async with DOWNLOAD_SEMAPHORE:
+            with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
+                try:
+                    title, files, was_split = await download_best_effort(
+                        url, tmpdir, prefer_telethon=telethon_configured(),
+                    )
+                except Exception:
+                    logger.exception("download failed for %s", url)
+                    return "error"
+                if not files:
+                    return "empty"
+                sent = await _deliver(
+                    bot, chat_id, tmpdir, title, files, was_split,
+                    "instagram",
+                )
+                if sent:
+                    return "ok"
+                if all(p.stat().st_size > MAX_BYTES for p in files):
+                    return "too_big"
                 return "empty"
-
-            # فایل‌های کوچک و بزرگ را جدا کن.
-            small = [p for p in files if p.stat().st_size <= MAX_BYTES]
-            large = [p for p in files if p.stat().st_size > MAX_BYTES]
-
-            # ۱) فایل‌های کوچک: مستقیم با Bot API.
-            sent = False
-            if small:
-                sent = await send_files(bot, chat_id, title, small, was_split)
-
-            # ۲) فایل‌های بزرگ: اول MTProto، بعد تقسیم.
-            for path in large:
-                if path.stat().st_size > TELETHON_MAX_BYTES:
-                    continue
-                if use_telethon:
-                    caption = title[:200] if title else None
-                    if await send_via_telethon(chat_id, path, caption):
-                        sent = True
-                        continue
-                    logger.warning(
-                        "Telethon send failed for %s; falling back to split",
-                        path,
-                    )
-                # ۳) تقسیم به قسمت‌ها و ارسال با Bot API.
-                if path.suffix.lower() in VIDEO_EXTS:
-                    parts_dir = Path(tmpdir) / f"parts-{path.stem}"
-                    parts = await asyncio.to_thread(
-                        _split_video_sync, path, parts_dir
-                    )
-                    if len(parts) > 1 and all(
-                        p.stat().st_size <= MAX_BYTES for p in parts
-                    ):
-                        if await send_files(
-                            bot, chat_id, title, parts, True
-                        ):
-                            sent = True
-                        continue
-                # نه Telethon شد، نه تقسیم؛ این فایل فرستاده نشد.
-
-            if sent:
-                return "ok"
-            # اگر حتی یک فایل هم زیر سقف نبود (و تقسیم هم نشد)، too_big
-            if all(p.stat().st_size > MAX_BYTES for p in files):
-                return "too_big"
-            return "empty"
     finally:
         try:
             await status.delete()
         except Exception:
             pass
+
+
+async def _watch_pornhub_progress(bot, chat_id: int, message_id: int,
+                                  tracker: ProgressTracker,
+                                  done: asyncio.Event,
+                                  is_photo: bool) -> None:
+    """هر ۵ ثانیه پیام پیشرفت را با درصد فعلی ویرایش می‌کند."""
+    last_pct = -1
+    try:
+        while not done.is_set():
+            await asyncio.sleep(5)
+            pct = tracker.percent()
+            if pct == last_pct:
+                continue
+            last_pct = pct
+            try:
+                if is_photo:
+                    await bot.edit_message_caption(
+                        chat_id=chat_id, message_id=message_id,
+                        caption=_progress_text(pct),
+                    )
+                else:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id,
+                        text=_progress_text(pct),
+                    )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+async def do_pornhub_download(bot, chat_id: int, url: str,
+                              height: int) -> str:
+    """دانلود پورن‌هاب با کیفیت انتخاب‌شده.
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    اول اطلاعات + کاور گرفته می‌شود، عکس کاور با نوار پیشرفت
+    فرستاده می‌شود و هر ۵ ثانیه ویرایش می‌شود؛ ویدیو با همان کاور
+    به‌عنوان thumbnail فرستاده می‌شود. اگر دانلود با کیفیت انتخاب‌شده
+    نشد، نردبان کیفیت (probe/720→480→360) به‌عنوان fallback اجرا
+    می‌شود."""
+    async with DOWNLOAD_SEMAPHORE:
+        with tempfile.TemporaryDirectory(prefix="ph-") as tmpdir:
+            tracker = ProgressTracker()
+            done = asyncio.Event()
+            progress_msg = None
+            is_photo = False
+            watcher = None
+            try:
+                # ۱) اطلاعات + کاور (بدون دانلود ویدیو)
+                info = await asyncio.to_thread(_fetch_info_sync, url)
+                title = str((info or {}).get("title") or "")
+                cover = None
+                if info:
+                    cover = await asyncio.to_thread(
+                        _download_cover_sync, info.get("thumbnail"), tmpdir
+                    )
+
+                # ۲) پیام پیشرفت با کاور
+                try:
+                    if cover is not None:
+                        with open(cover, "rb") as f:
+                            progress_msg = await bot.send_photo(
+                                chat_id=chat_id, photo=f,
+                                caption=_progress_text(0),
+                            )
+                        is_photo = True
+                    else:
+                        progress_msg = await bot.send_message(
+                            chat_id=chat_id, text=_progress_text(0),
+                        )
+                except Exception:
+                    progress_msg = None
+                    logger.exception("Could not send progress message")
+
+                if progress_msg is not None:
+                    watcher = asyncio.create_task(
+                        _watch_pornhub_progress(
+                            bot, chat_id, progress_msg.message_id,
+                            tracker, done, is_photo,
+                        )
+                    )
+
+                # ۳) دانلود با کیفیت انتخاب‌شده
+                files: list[Path] = []
+                was_split = False
+                subdir = Path(tmpdir) / f"h{height}"
+                subdir.mkdir(parents=True, exist_ok=True)
+                try:
+                    dl_title, files = await asyncio.to_thread(
+                        _download_once, url, height, str(subdir), tracker
+                    )
+                    if dl_title:
+                        title = dl_title
+                except Exception:
+                    logger.exception(
+                        "yt-dlp failed at %dp for %s", height, url
+                    )
+                    files = []
+
+                # ۴) اگر نشد، fallback به نردبان کیفیت
+                if not files:
+                    title, files, was_split = await download_best_effort(
+                        url, tmpdir,
+                        prefer_telethon=telethon_configured(),
+                        tracker=tracker,
+                    )
+                    if not files:
+                        return "error"
+
+                # ۵) ارسال (ویدیو با کاور)
+                sent = await _deliver(
+                    bot, chat_id, tmpdir, title, files, was_split,
+                    "title", thumb=cover,
+                )
+                if sent:
+                    return "ok"
+                if all(p.stat().st_size > MAX_BYTES for p in files):
+                    return "too_big"
+                return "empty"
+            finally:
+                done.set()
+                if watcher is not None:
+                    watcher.cancel()
+                if progress_msg is not None:
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+
+
+async def _background_download(bot, chat_id: int, url: str,
+                               platform: str, height: int | None = None) -> None:
+    """دانلود را در پس‌زمینه اجرا می‌کند تا هندلر فوراً برگردد و
+    ربات به دستورهای دیگر جواب بدهد. پیام خطا را خودش می‌فرستد."""
+    try:
+        if platform == "pornhub":
+            result = await do_pornhub_download(bot, chat_id, url, height or 720)
+        else:
+            result = await do_instagram_download(bot, chat_id, url)
+    except Exception:
+        logger.exception("download task failed for %s", url)
+        result = "error"
+    try:
+        if result == "too_big":
+            await bot.send_message(chat_id=chat_id, text=TOO_BIG_TEXT)
+        elif result in ("empty", "error"):
+            await bot.send_message(chat_id=chat_id, text=ERROR_TEXT)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# منوی انتخاب کیفیت پورن‌هاب
+# ---------------------------------------------------------------------------
+
+# دانلودهای پورن‌هاب در انتظار انتخاب کیفیت: key کوتاه → {url, chat_id}
+PENDING_PORNHUB: dict[str, dict] = {}
+
+
+async def _offer_pornhub_quality(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE,
+                                 url: str) -> None:
+    """منوی شیشه‌ای انتخاب کیفیت: دو ستونه، با ایموجی و برچسب تمیز."""
+    key = uuid.uuid4().hex[:8]
+    PENDING_PORNHUB[key] = {
+        "url": url,
+        "chat_id": update.message.chat.id,
+    }
+    keyboard = [
+        [
+            InlineKeyboardButton("✨ 1080p", callback_data=f"ph:{key}:1080"),
+            InlineKeyboardButton("🎞️ 720p", callback_data=f"ph:{key}:720"),
+        ],
+        [
+            InlineKeyboardButton("📺 480p", callback_data=f"ph:{key}:480"),
+            InlineKeyboardButton("📱 360p", callback_data=f"ph:{key}:360"),
+        ],
+        [InlineKeyboardButton("❌ لغو", callback_data=f"ph:{key}:cancel")],
+    ]
+    await update.message.reply_text(
+        "🎬 کیفیت ویدیو رو انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def pornhub_quality_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """کلیک روی منوی کیفیت پورن‌هاب: دانلود با همان کیفیت، در پس‌زمینه."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "ph":
+        return
+    _, key, choice = parts
+    pending = PENDING_PORNHUB.pop(key, None)
+    if pending is None:
+        try:
+            await query.edit_message_text("منقضی شده؛ لینک رو دوباره بفرست.")
+        except Exception:
+            pass
+        return
+    if choice == "cancel":
+        try:
+            await query.edit_message_text("لغو شد.")
+        except Exception:
+            pass
+        return
+    try:
+        height = int(choice)
+    except ValueError:
+        return
+    try:
+        await query.delete_message()
+    except Exception:
+        try:
+            await query.edit_message_text("⏳")
+        except Exception:
+            pass
+    asyncio.create_task(
+        _background_download(
+            context.bot, pending["chat_id"], pending["url"],
+            "pornhub", height,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +1057,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ساخت سشن Telethon با چت (/makesession) — فقط پی‌وی، بدون ترمینال
+# ساخت سشن مشترک Telethon با چت (/makesession) — فقط پی‌وی، بدون ترمینال
 # ---------------------------------------------------------------------------
 
 def _normalize_phone(raw: str) -> str | None:
@@ -727,7 +1066,6 @@ def _normalize_phone(raw: str) -> str | None:
     if phone.startswith("00"):
         phone = "+" + phone[2:]
     if phone.startswith("0"):
-        # با ۰ شروع شده (مثل ۰۹۱۲...)؛ کد کشور ندارد.
         return None
     if not phone.startswith("+"):
         phone = "+" + phone
@@ -749,14 +1087,12 @@ async def _abort_makesession(update, context, text: str) -> None:
 
 
 async def _finish_makesession(update, context) -> None:
-    """سشن را از کلاینت ذخیره می‌کند (حافظه + فایل) و وضعیت را پاک می‌کند.
+    """سشن مشترک را ذخیره می‌کند (حافظه + فایل) و وضعیت را پاک می‌کند.
     رشته سشن هیچ‌وقت توی چت فرستاده نمی‌شود."""
     state = context.user_data.pop("makesession", {})
     client = state.get("client")
     if client is None:
-        await update.message.reply_text(
-            "چیزی برای ذخیره نیست؛ دوباره /makesession را بزن."
-        )
+        await update.message.reply_text("دوباره /makesession بزن.")
         return
     session_str = None
     try:
@@ -769,57 +1105,38 @@ async def _finish_makesession(update, context) -> None:
         except Exception:
             pass
     if not session_str:
-        await update.message.reply_text(
-            "ذخیره سشن نشد؛ دوباره /makesession را بزن. 😕"
-        )
+        await update.message.reply_text("ذخیره نشد. دوباره /makesession بزن.")
         return
     saved_to_file = _save_telethon_session(session_str)
-    text = (
-        "سشن ذخیره شد، MTProto فعال شد. ✅\n"
-        "حالا فایل‌های بزرگ تا ۲ گیگابایت مستقیم فرستاده می‌شوند."
-    )
+    text = "انجام شد. ✅"
     if not saved_to_file:
-        text += (
-            "\n(نکته: ذخیره فایل سشن نشد؛ بعد از ری‌استارت ربات "
-            "باید دوباره بسازی.)"
-        )
+        text += "\nبعد از ری‌استارت باید دوباره بسازی."
     await update.message.reply_text(text)
 
 
 async def makesession_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """شروع ساخت سشن Telethon — فقط پی‌وی."""
+    """شروع ساخت سشن مشترک Telethon — فقط پی‌وی."""
     msg = update.message
     if msg is None:
         return
     if msg.chat.type != "private":
-        await msg.reply_text(
-            "ساخت سشن فقط توی پی‌وی کار می‌کند؛ توی گروه نمی‌شود. 🙂"
-        )
+        await msg.reply_text("فقط پی‌وی.")
         return
     if not TELETHON_AVAILABLE:
-        await msg.reply_text(
-            "Telethon روی سرور نصب نیست؛ فعلاً نمی‌شود سشن ساخت. 😕"
-        )
+        await msg.reply_text("Telethon نصب نیست.")
         return
     if _telethon_api_credentials() is None:
-        await msg.reply_text(
-            "اول باید TELETHON_API_ID و TELETHON_API_HASH توی "
-            "Variables ریل‌وی ست شده باشند."
-        )
+        await msg.reply_text("API ID و Hash ست نیست.")
         return
     if telethon_configured():
         context.user_data["makesession"] = {"step": "await_overwrite_confirm"}
         await msg.reply_text(
-            "سشن از قبل ساخته شده و MTProto فعال است. ✅\n"
-            "می‌خواهی دوباره بسازی و جایگزینش کنی؟\n"
-            "برای تایید «بله» را بفرست، برای لغو «خیر» را بفرست."
+            "از قبل فعاله. جایگزین بشه؟\n«بله» یا «خیر»"
         )
         return
     context.user_data["makesession"] = {"step": "await_phone"}
     await msg.reply_text(
-        "شماره تلگرامت را با کد کشور بفرست؛ مثلاً +98...\n"
-        "تلگرام یک کد ورود برایت می‌فرستد.\n"
-        "برای لغو، «لغو» را بفرست."
+        "شماره‌ت رو با کد کشور بفرست. (مثلاً +98...)\nبرای لغو «لغو» رو بفرست."
     )
 
 
@@ -836,37 +1153,26 @@ async def handle_makesession_step(
     step = state.get("step")
 
     if text in ("لغو", "انصراف"):
-        await _abort_makesession(update, context, "لغو شد. 🙂")
+        await _abort_makesession(update, context, "لغو شد.")
         return True
 
     if step == "await_overwrite_confirm":
         if text in ("بله", "آره", "yes", "Yes"):
             context.user_data["makesession"] = {"step": "await_phone"}
-            await msg.reply_text(
-                "باشه. شماره تلگرامت را با کد کشور بفرست؛ مثلاً +98...\n"
-                "برای لغو، «لغو» را بفرست."
-            )
+            await msg.reply_text("شماره‌ت رو با کد کشور بفرست.")
         else:
-            await _abort_makesession(
-                update, context,
-                "لغو شد؛ سشن قبلی سر جایش ماند. 🙂",
-            )
+            await _abort_makesession(update, context, "لغو شد.")
         return True
 
     if step == "await_phone":
         phone = _normalize_phone(text)
         if phone is None:
-            await msg.reply_text(
-                "شماره درست نیست. با کد کشور بفرست؛ مثلاً +98...\n"
-                "برای لغو، «لغو» را بفرست."
-            )
+            await msg.reply_text("شماره درست نیست. با کد کشور بفرست.")
             return True
         creds = _telethon_api_credentials()
         if creds is None:
             await _abort_makesession(
-                update, context,
-                "TELETHON_API_ID و TELETHON_API_HASH ست نیستند؛ "
-                "اول توی Variables ریل‌وی بذارشان.",
+                update, context, "API ID و Hash ست نیست.",
             )
             return True
         api_id, api_hash = creds
@@ -881,33 +1187,24 @@ async def handle_makesession_step(
             except Exception:
                 pass
             context.user_data.pop("makesession", None)
-            await msg.reply_text(
-                "نتونستم کد بفرستم؛ شماره را چک کن و دوباره /makesession را بزن. 😕"
-            )
+            await msg.reply_text("نتونستم کد بفرستم. دوباره /makesession بزن.")
             return True
         state["step"] = "await_code"
         state["phone"] = phone
         state["client"] = client
         state["phone_code_hash"] = sent.phone_code_hash
-        await msg.reply_text(
-            "کد ورود ۵ رقمی که تلگرام فرستاد را بفرست.\n"
-            "برای لغو، «لغو» را بفرست."
-        )
+        await msg.reply_text("کد ۵ رقمی رو بفرست.")
         return True
 
     if step == "await_code":
         code = re.sub(r"[\s\-]", "", text)
         if not re.fullmatch(r"\d{5}", code):
-            await msg.reply_text(
-                "کد باید ۵ رقم باشد؛ دوباره بفرست.\n"
-                "برای لغو، «لغو» را بفرست."
-            )
+            await msg.reply_text("کد باید ۵ رقم باشه.")
             return True
         client = state.get("client")
         if client is None:
             await _abort_makesession(
-                update, context,
-                "ارتباط قطع شد؛ دوباره /makesession را بزن.",
+                update, context, "قطع شد. دوباره /makesession بزن.",
             )
             return True
         try:
@@ -917,13 +1214,12 @@ async def handle_makesession_step(
             )
         except SessionPasswordNeededError:
             state["step"] = "await_2fa"
-            await msg.reply_text("رمز دومرحله‌ای حسابت را بفرست.")
+            await msg.reply_text("رمز دومرحله‌ای رو بفرست.")
             return True
         except Exception:
             logger.exception("Telethon sign_in failed")
             await _abort_makesession(
-                update, context,
-                "کد اشتباه بود یا منقضی شد؛ دوباره /makesession را بزن. 😕",
+                update, context, "کد اشتباهه. دوباره /makesession بزن.",
             )
             return True
         await _finish_makesession(update, context)
@@ -933,8 +1229,7 @@ async def handle_makesession_step(
         client = state.get("client")
         if client is None:
             await _abort_makesession(
-                update, context,
-                "ارتباط قطع شد؛ دوباره /makesession را بزن.",
+                update, context, "قطع شد. دوباره /makesession بزن.",
             )
             return True
         try:
@@ -942,52 +1237,47 @@ async def handle_makesession_step(
         except Exception:
             logger.exception("Telethon 2FA sign_in failed")
             await _abort_makesession(
-                update, context,
-                "رمز دومرحله‌ای اشتباه بود؛ دوباره /makesession را بزن. 😕",
+                update, context, "رمز اشتباهه. دوباره /makesession بزن.",
             )
             return True
         await _finish_makesession(update, context)
         return True
 
-    # وضعیت ناشناخته؛ پاکش کن تا گیر نکند.
     context.user_data.pop("makesession", None)
     return False
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هر پیام متنی: اگر لینک اینستا/پورن‌هاب داشت، پردازش کن؛ اگر نه، رد شو."""
+    """هر پیام متنی: لینک اینستا/پورن‌هاب را پردازش کن؛ اگر نه، رد شو.
+    دانلود در پس‌زمینه اجرا می‌شود تا ربات به بقیه دستورها جواب بدهد."""
     msg = update.message
     if msg is None or not msg.text:
         return
 
-    # اگر کاربر وسط ساخت سشن با /makesession است، پیامش را آن‌جا مصرف کن.
     if await handle_makesession_step(update, context):
         return
 
     url = find_url(msg.text)
     if not url:
-        # توی پی‌وی یک راهنمای کوتاه بده؛ توی گروه ساکت باش تا اسپم نشه.
         if msg.chat.type == "private":
-            await msg.reply_text(
-                "لینک اینستاگرام یا پورن‌هاب رو بفرست تا دانلودش کنم. 🙂\n"
-                "برای راهنما /start رو بزن."
-            )
+            await msg.reply_text("لینک اینستاگرام یا پورن‌هاب رو بفرست.")
         return
 
     platform = detect_platform(url)
     if not platform:
         if msg.chat.type == "private":
-            await msg.reply_text(
-                "این لینک رو نمی‌شناسم. فقط لینک اینستاگرام و پورن‌هاب رو می‌تونم دانلود کنم."
-            )
+            await msg.reply_text("فقط اینستاگرام و پورن‌هاب.")
         return
 
-    # اینستاگرام و پورن‌هاب: مستقیم دانلود کن
-    result = await do_download_and_send(context.bot, msg.chat.id, url)
-    if result == "too_big":
-        await msg.reply_text(TOO_BIG_TEXT)
-    elif result in ("empty", "error"):
-        await msg.reply_text(ERROR_TEXT)
+    if platform == "pornhub":
+        # پورن‌هاب: اول منوی انتخاب کیفیت، دانلود بعد از انتخاب کاربر.
+        await _offer_pornhub_quality(update, context, url)
+        return
+
+    # اینستاگرام: دانلود مستقیم، در پس‌زمینه.
+    asyncio.create_task(
+        _background_download(context.bot, msg.chat.id, url, "instagram")
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1008,10 +1298,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).concurrent_updates(10).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("makesession", makesession_cmd))
+    app.add_handler(CallbackQueryHandler(pornhub_quality_callback, pattern=r"^ph:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
