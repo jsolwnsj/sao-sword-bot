@@ -7,12 +7,14 @@
 - پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
   پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
 - فایل بزرگ: اول با کیفیت پایین‌تر مستقیم دانلود می‌شود
-  (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و فقط اگر کوچک‌ترین دانلود مستقیم
-  هم بالای ۴۸ مگ بود، با ffmpeg -c copy (بدون ریکد) تقسیم
-  می‌شود. فشرده‌سازی (ریکد) حذف شده است چون خیلی طول می‌کشید.
-  ارسال فقط با خود ربات (Bot API) است؛ ارسال با حساب کاربری
-  (Telethon/MTProto) پیش‌فرض خاموش است و فقط اگر
-  TELETHON_SEND_ENABLED=true ست شده باشد استفاده می‌شود.
+  (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p). اگر فایل باز هم بالای ۴۸ مگ بود،
+  **خود ربات** با Telethon bot client (MTProto با BOT_TOKEN،
+  نه سشن حساب کاربری) تا ۲ گیگابایت می‌فرستد — فرستنده خود
+  ربات است، نه اکانت؛ نه تقسیم می‌شود، نه فشرده‌سازی. تقسیم
+  فقط آخرین راه است و سقف ۱۰ قسمت دارد (قسمت‌ها نزدیک ۴۸ مگ‌اند؛
+  باگ ۱۵۲ قسمت که از segment_time خیلی کوچک می‌آمد رفع شده است).
+  ارسال با حساب کاربری (سشن Telethon) فقط fallback است و فقط
+  وقتی TELETHON_SEND_ENABLED=true ست شده باشد استفاده می‌شود.
 - پیام پیشرفت همه فازها را نشان می‌دهد: آماده‌سازی، دانلود،
   ارسال مستقیم، تقسیم و آپلود — هر کدام با نوار،
   درصد، سرعت و ETA؛ هر ۵ ثانیه در همان پیام ویرایش می‌شود.
@@ -100,6 +102,20 @@ MAX_BYTES = 48 * 1024 * 1024
 
 # سقف ارسال فایل با MTProto (حساب کاربری Telethon): ۲ گیگابایت.
 TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+# سقف ارسال فایل با Telethon bot client (خود ربات با BOT_TOKEN،
+# MTProto): ۲ گیگابایت — همان سقف MTProto، ولی فرستنده خود ربات
+# است، نه حساب کاربری. سقف ۵۰ مگ فقط برای Bot API از طریق HTTP
+# است؛ MTProto آن را ندارد.
+BOT_TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+# سقف تعداد قسمت‌های تقسیم: اگر فایل برای جا شدن زیر ۴۸ مگ به
+# بیشتر از ۱۰ قسمت نیاز داشته باشد، اصلاً تقسیم نمی‌شود (به‌جای
+# آن کیفیت پایین‌تر دانلود می‌شود یا با bot client فرستاده
+# می‌شود). این سقف باگ ۱۵۲ قسمت را رفع می‌کند: قبلاً segment_time
+# حداقل ۳۰ ثانیه بود و در retry تا ۱۵ ثانیه نصف می‌شد، پس برای
+# ویدیوی طولانی، ده‌ها قسمت خیلی کوچک ساخته می‌شد.
+MAX_SPLIT_PARTS = 10
 
 # حداکثر ۳ دانلود هم‌زمان؛ دانلود چهارم به بعد توی صف می‌ماند و
 # به کاربر گفته می‌شود. هر دانلود پوشه، پیام پیشرفت و ترکر خودش را
@@ -404,6 +420,91 @@ async def send_via_telethon(chat_id: int, path: Path, caption: str | None,
         return True
     except Exception:
         logger.exception("Telethon send failed for %s", path)
+        return False
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def _bot_telethon_credentials() -> tuple[int, str, str] | None:
+    """(api_id, api_hash, bot_token) برای Telethon bot client؛
+    اگر هر کدام نباشد None. نیازی به سشن حساب کاربری ندارد —
+    ربات با BOT_TOKEN خودش وارد می‌شود."""
+    if not TELETHON_AVAILABLE:
+        return None
+    creds = _telethon_api_credentials()
+    if creds is None:
+        return None
+    bot_token = os.environ.get("BOT_TOKEN", "").strip()
+    if not bot_token:
+        return None
+    api_id, api_hash = creds
+    return api_id, api_hash, bot_token
+
+
+def bot_telethon_available() -> bool:
+    """True اگر Telethon bot client قابل ساخت باشد: API ID/Hash و
+    BOT_TOKEN ست باشند و کتابخانه نصب باشد."""
+    return _bot_telethon_credentials() is not None
+
+
+async def send_via_telethon_bot(chat_id: int, path: Path, caption: str | None,
+                                thumb: str | None = None,
+                                tracker: ProgressTracker | None = None) -> bool:
+    """
+    فایل را با MTProto **به‌عنوان خود ربات** می‌فرستد — نه حساب
+    کاربری. کلاینت Telethon با BOT_TOKEN وارد می‌شود
+    (client.start(bot_token=...))، پس فرستنده خود ربات است و
+    سقف ارسال ۲ گیگابایت است، نه ۵۰ مگ Bot API. این همان راهی
+    است که ربات‌های دانلودر روی سرور خودشان استفاده می‌کردند:
+    سقف ۵۰ مگ فقط برای Bot API از طریق HTTP است؛ MTProto آن را
+    ندارد. نیازی به سشن حساب کاربری (/makesession) ندارد و فقط
+    به TELETHON_API_ID و TELETHON_API_HASH و BOT_TOKEN نیاز دارد.
+    در صورت هر خطایی False برمی‌گرداند تا مسیر بعدی امتحان شود.
+    نکته: ربات باید عضو گروه باشد (برای ارسال به گروه) یا کاربر
+    ربات را استارت کرده باشد (برای پی‌وی).
+    """
+    creds = _bot_telethon_credentials()
+    if creds is None:
+        return False
+    if path.stat().st_size > BOT_TELETHON_MAX_BYTES:
+        return False
+    api_id, api_hash, bot_token = creds
+
+    client = None
+    try:
+        # هر ارسال یک کلاینت تازه می‌سازد تا با polling خود
+        # python-telegram-bot (که همان BOT_TOKEN را دارد) و با
+        # دانلودهای هم‌زمان تداخل نکند.
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        await client.start(bot_token=bot_token)
+        kwargs = {"supports_streaming": True}
+        if thumb:
+            kwargs["thumb"] = thumb
+        if tracker is not None:
+            tracker.begin_upload(1, path.stat().st_size)
+
+            def _bot_progress(current: int, total: int) -> None:
+                tracker.upload_bytes = int(current)
+                tracker.upload_total_bytes = int(total)
+
+            kwargs["progress_callback"] = _bot_progress
+        await client.send_file(
+            chat_id,
+            str(path),
+            caption=caption,
+            **kwargs,
+        )
+        logger.info(
+            "Sent %s (%d bytes) via Telethon bot client (as bot) to %s",
+            path, path.stat().st_size, chat_id,
+        )
+        return True
+    except Exception:
+        logger.exception("Telethon bot-client send failed for %s", path)
         return False
     finally:
         if client is not None:
@@ -935,14 +1036,34 @@ def _run_ffmpeg_progress(args: list[str], duration_s: float | None,
 def _split_video_sync(path: Path, workdir: Path,
                       tracker: ProgressTracker | None = None) -> list[Path]:
     """ویدیو را با ffmpeg به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند (بدون ریکد).
-    درصد تقسیم توی ترکر می‌آید."""
+    درصد تقسیم توی ترکر می‌آید.
+    سقف: اگر برای جا شدن زیر ۴۸ مگ به بیشتر از MAX_SPLIT_PARTS
+    (۱۰) قسمت نیاز باشد، اصلاً تقسیم نمی‌شود و فایل اصلی
+    برگردانده می‌شود — به‌جای ۱۵۲ قسمت کوچک، بهتر است کیفیت
+    پایین‌تر دانلود شود یا فایل با bot client فرستاده شود.
+    قسمت‌ها نزدیک ۴۸ مگ‌اند: segment_time حداقل ۶۰ ثانیه است و
+    در retry هم کمتر از ۶۰ نمی‌شود (قبلاً تا ۱۵ ثانیه نصف می‌شد
+    و برای ویدیوی طولانی ده‌ها قسمت کوچک می‌ساخت — همان باگ
+    ۱۵۲ قسمت)."""
+    import math
+
     size = path.stat().st_size
     if size <= MAX_BYTES:
         return [path]
 
+    # برآورد تعداد قسمت‌ها از روی حجم؛ اگر بیشتر از سقف شد، تقسیم نکن.
+    estimated_parts = math.ceil(size / (MAX_BYTES * 0.92))
+    if estimated_parts > MAX_SPLIT_PARTS:
+        logger.warning(
+            "Split would need %d parts for %s (%d bytes); "
+            "refusing to split (cap %d).",
+            estimated_parts, path, size, MAX_SPLIT_PARTS,
+        )
+        return [path]
+
     duration = _probe_duration_seconds(path)
     if duration and duration > 0:
-        segment_time = max(30, int(duration * MAX_BYTES * 0.92 / size))
+        segment_time = max(60, int(duration * MAX_BYTES * 0.92 / size))
     else:
         segment_time = 300
 
@@ -973,20 +1094,32 @@ def _split_video_sync(path: Path, workdir: Path,
 
         parts = sorted(workdir.glob(f"{path.stem}_part*.mp4"))
         parts = [p for p in parts if p.is_file() and p.stat().st_size > 0]
+        if len(parts) > MAX_SPLIT_PARTS:
+            logger.warning(
+                "Split produced %d parts for %s; refusing (cap %d).",
+                len(parts), path, MAX_SPLIT_PARTS,
+            )
+            return [path]
         if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
             return parts
-        segment_time = max(15, segment_time // 2)
+        segment_time = max(60, segment_time // 2)
 
     parts = sorted(workdir.glob(f"{path.stem}_part*.mp4"))
-    return [p for p in parts if p.is_file() and p.stat().st_size > 0] or [path]
+    parts = [p for p in parts if p.is_file() and p.stat().st_size > 0]
+    if len(parts) > MAX_SPLIT_PARTS:
+        return [path]
+    return parts or [path]
 
 
 async def _fit_for_bot_api(path: Path, tmpdir: str,
                            tracker: ProgressTracker | None = None) -> list[Path]:
     """فایل را برای ارسال با Bot API جا می‌کند: اگر زیر ۴۸ مگ است
     همان را برمی‌گرداند؛ وگرنه با ffmpeg -c copy (بدون ریکد،
-    سریع) به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند. فشرده‌سازی (ریکد)
-    حذف شده است چون خیلی طول می‌کشید. درصد تقسیم توی ترکر می‌آید."""
+    سریع) به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند — ولی فقط اگر
+    بیشتر از ۱۰ قسمت نشود؛ اگر بیشتر شد، فایل اصلی برگردانده
+    می‌شود تا کیفیت پایین‌تر دانلود شود یا با bot client
+    فرستاده شود. فشرده‌سازی (ریکد) حذف شده است چون خیلی طول
+    می‌کشید. درصد تقسیم توی ترکر می‌آید."""
     if path.stat().st_size <= MAX_BYTES:
         return [path]
     parts_dir = Path(tmpdir) / f"parts-{path.stem}"
@@ -1005,7 +1138,8 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
     برمی‌گرداند: (title, files, was_split)
     اگر حجم معلوم نشد، حلقه قدیمی (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) به‌عنوان
     fallback می‌ماند. اگر prefer_telethon=True باشد، مستقیم ۷۲۰p
-    دانلود می‌شود تا اول Telethon امتحان شود.
+    دانلود می‌شود تا اول با Telethon bot client (خود ربات، تا ۲ گیگ)
+    فرستاده شود؛ اینجا هیچ تقسیمی انجام نمی‌شود.
     """
     if prefer_telethon:
         subdir = Path(tmpdir) / "h720"
@@ -1065,11 +1199,10 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
     main = max(files, key=lambda p: p.stat().st_size)
     if main.stat().st_size <= MAX_BYTES:
         return title, files, False
-    # بزرگ بود؛ فقط تقسیم کن (بدون فشرده‌سازی).
-    fitted = await _fit_for_bot_api(main, tmpdir, tracker)
-    if fitted != [main]:
-        return title, fitted, len(fitted) > 1
-    return title, files, False
+    # بزرگ بود؛ اینجا تقسیم نمی‌کنیم — _deliver اول با Telethon
+    # bot client (خود ربات، تا ۲ گیگ) می‌فرستد و تقسیم فقط آخرین
+    # راه است (با سقف ۱۰ قسمت). تقسیم کردن همین‌جا بود که ویدیو
+    # را بی‌خود تیکه‌تیکه می‌کرد.
 
 
 # ---------------------------------------------------------------------------
@@ -1144,10 +1277,12 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
     فرستاده شد. ارسال همیشه با خود ربات (Bot API) است.
     caption_mode: "instagram" → کپشن همه قسمت‌ها «@ربات ❤️»؛
     "title" → کپشن عنوان (قسمت‌ها با شماره قسمت).
-    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ
-    با ffmpeg -c copy (بدون ریکد) تقسیم می‌شوند. ارسال با حساب
-    کاربری (Telethon) فقط وقتی انجام می‌شود که
-    TELETHON_SEND_ENABLED=true باشد."""
+    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول با
+    Telethon bot client (خود ربات با BOT_TOKEN، تا ۲ گیگ) — بدون
+    تقسیم، بدون فشرده‌سازی؛ ۳) اگر آن نشد، با حساب کاربری
+    (Telethon) فقط وقتی TELETHON_SEND_ENABLED=true باشد؛
+    ۴) فقط به‌عنوان آخرین راه، با ffmpeg -c copy (بدون ریکد)
+    تقسیم می‌شوند — با سقف ۱۰ قسمت."""
     if not files:
         return False
 
@@ -1182,15 +1317,31 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
     for path in large:
         caps = await build_captions(len(files), was_split)
         cap = caps[files.index(path)]
-        # ارسال با حساب کاربری فقط وقتی صریحاً فعال شده باشد؛
-        # پیش‌فرض: ویدیو را فقط خود ربات می‌فرستد.
+        thumb_arg = str(thumb) if thumb is not None else None
+        # ۱) اول با خود ربات از طریق Telethon bot client (MTProto
+        # با BOT_TOKEN، تا ۲ گیگ) — فرستنده خود ربات است، نه
+        # حساب کاربری؛ نه تقسیم می‌شود، نه فشرده‌سازی. نیازی به
+        # سشن حساب کاربری ندارد.
+        if path.stat().st_size <= BOT_TELETHON_MAX_BYTES:
+            if await send_via_telethon_bot(
+                chat_id, path, cap, thumb=thumb_arg, tracker=tracker,
+            ):
+                sent = True
+                continue
+            logger.warning(
+                "Telethon bot-client send failed for %s; "
+                "trying user-session fallback",
+                path,
+            )
+        # ۲) fallback: ارسال با حساب کاربری فقط وقتی صریحاً فعال
+        # شده باشد؛ پیش‌فرض خاموش است.
         if (
             telethon_send_enabled()
             and path.stat().st_size <= TELETHON_MAX_BYTES
         ):
             if await send_via_telethon(
                 chat_id, path, cap,
-                thumb=str(thumb) if thumb is not None else None,
+                thumb=thumb_arg,
                 tracker=tracker,
             ):
                 sent = True
@@ -1199,7 +1350,8 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
                 "Telethon send failed for %s; falling back to split",
                 path,
             )
-        # تقسیم؛ فقط با Bot API فرستاده می‌شود.
+        # ۳) فقط به‌عنوان آخرین راه: تقسیم (سقف ۱۰ قسمت)؛
+        # فقط با Bot API فرستاده می‌شود.
         fitted = await _fit_for_bot_api(path, tmpdir, tracker)
         fitted = [p for p in fitted if p.stat().st_size <= MAX_BYTES]
         if fitted:
@@ -1245,7 +1397,7 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
             try:
                 title, files, was_split = await download_best_effort(
                     url, tmpdir,
-                    prefer_telethon=telethon_send_enabled(),
+                    prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
                     tracker=tracker,
                 )
             except Exception:
@@ -1403,7 +1555,7 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
             if not files:
                 title, files, was_split = await download_best_effort(
                     url, tmpdir,
-                    prefer_telethon=telethon_send_enabled(),
+                    prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
                     tracker=tracker,
                 )
                 if not files:
