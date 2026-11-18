@@ -40,9 +40,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qs, quote, urlparse
 import uuid
 from pathlib import Path
@@ -2052,12 +2054,279 @@ def _gfw_pick_audio(entries: list) -> dict | None:
     return best
 
 
+def _probe_range_support_sync(url: str,
+                              error_out: dict | None = None) -> str:
+    """می‌پرسد سرور Range را می‌فهمد یا نه (یک درخواست ۱ بایتی).
+    برمی‌گرداند: "range" (۲۰۶) | "no_range" (۲۰۰) | "forbidden"
+    (۴۰۳) | "gone" (۴۰۴/۴۱۰) | "unknown" (هر خطای دیگر)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": CHROME_USER_AGENT,
+            "Referer": "https://www.youtube.com/",
+            "Range": "bytes=0-0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status == 206:
+                return "range"
+            if resp.status == 200:
+                return "no_range"
+            return "unknown"
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            if error_out is not None:
+                error_out["forbidden"] = True
+            return "forbidden"
+        if e.code in (404, 410):
+            return "gone"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _download_part_sync(url: str, start: int, end: int, part_path: Path,
+                        counter: list, lock: threading.Lock,
+                        tracker, t0: float, total: int,
+                        attempts: int = 3) -> str:
+    """یک بازه بایتی را با Range دانلود می‌کند؛ هر قسمت خودش تا
+    ۳ بار امتحان می‌شود (فقط همان قسمت، نه کل فایل).
+    برمی‌گرداند: "ok" | "forbidden" | "gone" | "no_range" | "failed"."""
+    size = end - start + 1
+    headers = {
+        "User-Agent": CHROME_USER_AGENT,
+        "Referer": "https://www.youtube.com/",
+        "Range": f"bytes={start}-{end}",
+    }
+    for attempt in range(1, attempts + 1):
+        try:
+            if part_path.is_file():
+                part_path.unlink()
+        except OSError:
+            pass
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if resp.status == 200:
+                    return "no_range"
+                if resp.status != 206:
+                    raise urllib.error.HTTPError(
+                        url, resp.status, "unexpected status", {}, None
+                    )
+                with open(part_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        if tracker is not None:
+                            with lock:
+                                counter[0] += len(chunk)
+                                elapsed = time.monotonic() - t0
+                                tracker.downloaded = counter[0]
+                                tracker.speed = (
+                                    counter[0] / elapsed if elapsed > 0 else 0
+                                )
+                                if total and tracker.speed > 0:
+                                    tracker.eta = int(
+                                        (total - counter[0]) / tracker.speed
+                                    )
+                if part_path.is_file() \
+                        and part_path.stat().st_size == size:
+                    return "ok"
+                logger.warning(
+                    "Part %d-%d incomplete (attempt %d/%d)",
+                    start, end, attempt, attempts,
+                )
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                return "forbidden"
+            if e.code in (404, 410):
+                return "gone"
+            logger.warning(
+                "Part %d-%d HTTP %s (attempt %d/%d)",
+                start, end, e.code, attempt, attempts,
+            )
+        except Exception:
+            logger.warning(
+                "Part %d-%d failed (attempt %d/%d)",
+                start, end, attempt, attempts, exc_info=True,
+            )
+    return "failed"
+
+
+def _download_ranged_sync(url: str, dest: Path, total: int, tracker=None,
+                          attempts: int = 3,
+                          error_out: dict | None = None) -> bool:
+    """فایل را در حداکثر ۸ قسمت موازی با Range دانلود می‌کند
+    (هر قسمت حدود ۸ تا ۱۰ مگابایت؛ فایل کوچک یک قسمت دارد)،
+    بعد قسمت‌ها را به ترتیب به هم می‌چسباند و اندازه نهایی را
+    با total چک می‌کند. True اگر فایل کامل آمد."""
+    nparts = max(1, min(8, -(-total // (8 * 1024 * 1024))))
+    part_size = -(-total // nparts)
+    bounds = []
+    for i in range(nparts):
+        start = i * part_size
+        end = min(start + part_size, total) - 1
+        bounds.append((start, end))
+    if tracker is not None:
+        tracker.set_phase("download", 0)
+        tracker.total = total
+        tracker.downloaded = 0
+        tracker.speed = 0.0
+        tracker.eta = 0
+    t0 = time.monotonic()
+    counter = [0]
+    lock = threading.Lock()
+    part_paths = [
+        dest.parent / f"{dest.name}.part{i}" for i in range(nparts)
+    ]
+    statuses: dict[int, str] = {}
+    try:
+        for p in part_paths:
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+        with ThreadPoolExecutor(max_workers=min(8, nparts)) as ex:
+            futs = {
+                ex.submit(
+                    _download_part_sync, url, s, e, part_paths[i],
+                    counter, lock, tracker, t0, total, attempts,
+                ): i
+                for i, (s, e) in enumerate(bounds)
+            }
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    statuses[idx] = fut.result()
+                except Exception:
+                    statuses[idx] = "failed"
+                if statuses[idx] == "forbidden":
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+        if any(s == "forbidden" for s in statuses.values()):
+            if error_out is not None:
+                error_out["forbidden"] = True
+            return False
+        if any(s == "gone" for s in statuses.values()):
+            return False
+        if len(statuses) != nparts \
+                or any(s != "ok" for s in statuses.values()):
+            logger.warning(
+                "Ranged download incomplete for %s: %s", dest, statuses
+            )
+            return False
+        try:
+            if dest.is_file():
+                dest.unlink()
+        except OSError:
+            pass
+        with open(dest, "wb") as out:
+            for p in part_paths:
+                with open(p, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        if dest.is_file() and dest.stat().st_size == total:
+            return True
+        logger.warning(
+            "Ranged download size mismatch for %s: %d of %d",
+            dest, dest.stat().st_size if dest.is_file() else -1, total,
+        )
+        return False
+    finally:
+        for p in part_paths:
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+
+
 def _download_url_sync(url: str, dest: Path, tracker=None,
                        total_size: int | None = None,
-                       attempts: int = 3) -> bool:
-    """یک فایل را با urllib استریم دانلود می‌کند (لینک مستقیم
+                       attempts: int = 3,
+                       error_out: dict | None = None) -> bool:
+    """یک فایل را با urllib دانلود می‌کند (لینک مستقیم
     googlevideo)؛ درصد/سرعت/ETA توی ترکر می‌آید (فاز دانلود).
-    تا ۳ بار دوباره امتحان می‌کند؛ True اگر فایل کامل آمد."""
+    استریم ساده googlevideo تا حد چند ده کیلوبایت بر ثانیه
+    خفه می‌شود و وسط راه timeout می‌خورد، پس وقتی اندازه کل
+    معلوم است، فایل در حداکثر ۸ قسمت موازی با Range دانلود
+    می‌شود (هر قسمت جدا retry می‌شود)؛ اگر اندازه معلوم نباشد
+    یا سرور Range نفهمد، همان استریم ساده قبلی استفاده می‌شود.
+    تا ۳ بار دوباره امتحان می‌کند؛ True اگر فایل کامل آمد.
+    اگر 403 خورد، error_out["forbidden"]=True می‌شود تا تماس‌گیرنده
+    بتواند لینک تازه بگیرد."""
+    total = total_size if isinstance(total_size, int) \
+        and total_size > 0 else None
+    if total is None:
+        return _download_single_stream_sync(
+            url, dest, tracker, attempts, None, error_out
+        )
+    probe = _probe_range_support_sync(url, error_out)
+    if probe == "forbidden":
+        return False
+    if probe != "range":
+        return _download_single_stream_sync(
+            url, dest, tracker, attempts, total, error_out
+        )
+    return _download_ranged_sync(
+        url, dest, total, tracker, attempts, error_out
+    )
+
+
+async def _download_gfw_file(yt_url: str, entry: dict, dest: Path,
+                             tracker, kind: str,
+                             height: int | None = None) -> bool:
+    """یک فایل GFw (ویدیو یا صدا) را دانلود می‌کند؛ اگر 403 خورد،
+    لینک‌های تازه را یک بار از وب‌سرویس می‌گیرد و همان فایل را
+    یک بار دیگر امتحان می‌کند. True یعنی فایل کامل آمد.
+    kind: "video" (با height برای انتخاب دوباره) یا "audio"."""
+    size = entry.get("size")
+    total = int(size) if isinstance(size, int) else None
+    err: dict = {}
+    ok = await asyncio.to_thread(
+        _download_url_sync, str(entry["url"]), dest, tracker, total,
+        error_out=err,
+    )
+    if ok or not err.get("forbidden"):
+        return ok
+    logger.warning(
+        "GFw download 403 for %s; refreshing links once", yt_url
+    )
+    data, _ = await asyncio.to_thread(
+        _gfw_youtube_info_sync, yt_url, GFWDEV_API_KEY
+    )
+    if data is None:
+        return False
+    downloads = data.get("downloads") or {}
+    if kind == "video":
+        fresh = _gfw_pick_video(
+            downloads.get("video") or [], height or 0
+        )
+    else:
+        fresh = _gfw_pick_audio(downloads.get("audio") or [])
+    if fresh is None or not fresh.get("url"):
+        return False
+    fsize = fresh.get("size")
+    return await asyncio.to_thread(
+        _download_url_sync, str(fresh["url"]), dest, tracker,
+        int(fsize) if isinstance(fsize, int) else None,
+    )
+
+
+def _download_single_stream_sync(url: str, dest: Path, tracker=None,
+                                 attempts: int = 3,
+                                 total_size: int | None = None,
+                                 error_out: dict | None = None) -> bool:
+    """استریم ساده قبلی (fallback وقتی اندازه معلوم نیست یا
+    سرور Range نمی‌فهمد)؛ تا ۳ بار دوباره امتحان می‌کند؛
+    True اگر فایل کامل آمد. 403 را در error_out گزارش می‌کند."""
     for attempt in range(1, attempts + 1):
         try:
             if dest.is_file():
@@ -2120,6 +2389,8 @@ def _download_url_sync(url: str, dest: Path, tracker=None,
                 "Download HTTP %s for %s (attempt %d/%d)",
                 e.code, url, attempt, attempts,
             )
+            if e.code == 403 and error_out is not None:
+                error_out["forbidden"] = True
             if e.code in (403, 404, 410):
                 return False
         except Exception:
@@ -2174,7 +2445,9 @@ async def do_youtube_download(bot, chat_id: int, url: str,
     وب‌سرویس همه ویدیوها را فقط-تصویر (adaptive) می‌دهد، پس
     ویدیو حتماً با بهترین صدا میکس می‌شود (ffmpeg -c copy،
     بدون ریکد)؛ اگر دانلود صدا یا میکس نشد، خطا برمی‌گردد و
-    ویدیوی بی‌صدا فرستاده نمی‌شود.
+    ویدیوی بی‌صدا فرستاده نمی‌شود. دانلود لینک‌های googlevideo
+    با درخواست‌های Range موازی انجام می‌شود (استریم ساده خفه
+    می‌شود) و اگر 403 خورد، لینک تازه یک بار گرفته می‌شود.
     برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age'
     | 'no_key' | 'bad_key' | 'unavailable'
     ('no_key' یعنی کلید وب‌سرویس ست نشده؛ 'bad_key' یعنی کلید
@@ -2264,10 +2537,8 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 subdir.mkdir(parents=True, exist_ok=True)
                 fmt = (entry.get("format") or "m4a").lower()
                 raw = subdir / f"audio.{fmt}"
-                size = entry.get("size")
-                ok = await asyncio.to_thread(
-                    _download_url_sync, str(entry["url"]), raw, tracker,
-                    int(size) if isinstance(size, int) else None,
+                ok = await _download_gfw_file(
+                    url, entry, raw, tracker, "audio"
                 )
                 if not ok:
                     return "error"
@@ -2289,10 +2560,8 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 subdir.mkdir(parents=True, exist_ok=True)
                 vfmt = (ventry.get("format") or "mp4").lower()
                 vpath = subdir / f"video.{vfmt}"
-                vsize = ventry.get("size")
-                ok = await asyncio.to_thread(
-                    _download_url_sync, str(ventry["url"]), vpath, tracker,
-                    int(vsize) if isinstance(vsize, int) else None,
+                ok = await _download_gfw_file(
+                    url, ventry, vpath, tracker, "video", height
                 )
                 if not ok:
                     return "error"
@@ -2302,11 +2571,8 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                         return "error"
                     afmt = (aentry.get("format") or "m4a").lower()
                     apath = subdir / f"audio.{afmt}"
-                    asize = aentry.get("size")
-                    ok = await asyncio.to_thread(
-                        _download_url_sync, str(aentry["url"]), apath,
-                        tracker,
-                        int(asize) if isinstance(asize, int) else None,
+                    ok = await _download_gfw_file(
+                        url, aentry, apath, tracker, "audio"
                     )
                     if not ok:
                         return "error"
