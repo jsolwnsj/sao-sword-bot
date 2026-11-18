@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 
 # ffmpeg برای تبدیل صدا به mp3 لازم است؛ yt-dlp هم ازش استفاده می‌کند.
+# curl-cffi (برای impersonation مرورگر در yt-dlp) از requirements.txt
+# نصب می‌شود و به پکیج سیستمی اضافه نیاز ندارد؛ wheel آن libcurl
+# مخصوص impersonation را همراه خودش دارد.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && apt-get clean \

@@ -1,3 +1,4 @@
 python-telegram-bot>=21.0,<22
-yt-dlp>=2024.1.0
+yt-dlp>=2026.10.26
 telethon>=1.36
+curl-cffi>=0.13.0

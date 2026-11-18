@@ -5,7 +5,10 @@
 - هم توی پی‌وی کار می‌کند، هم توی گروه (به شرطی که Privacy Mode ربات خاموش باشد).
 - لینک اینستاگرام (ریلز/پست عمومی) یا پورن‌هاب را می‌گیرد،
   با yt-dlp دانلود می‌کند و همان‌جا توی همان چت برمی‌گرداند.
-- فقط محتوای عمومی، بدون لاگین و بدون کوکی.
+- فقط محتوای عمومی. yt-dlp با impersonation مرورگر کروم کار می‌کند
+  تا پورن‌هاب درخواست را با 403 رد نکند؛ اگر باز هم 403 داد،
+  کوکی‌های اختیاری پورن‌هاب (فایل /data/cookies.txt یا متغیر
+  PORNHUB_COOKIES) به yt-dlp داده می‌شوند (بخش کوکی در README).
 - یوتیوب توی این نسخه نیست.
 - محدودیت تلگرام: سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات است و
   با «مستقیم فرستادن» دور زده نمی‌شود. ربات اول کیفیت را پایین می‌آورد
@@ -59,6 +62,28 @@ except ImportError:  # pragma: no cover - telethon not installed
         """جایگزین ساختگی؛ فقط وقتی Telethon نصب نیست استفاده می‌شود."""
 
     TELETHON_AVAILABLE = False
+
+# curl-cffi برای impersonation مرورگر در yt-dlp لازم است؛ اگر نصب نباشد،
+# yt-dlp بدون impersonation کار می‌کند (فقط هدرها و ری‌ترای‌ها اعمال
+# می‌شوند) و دانلود ادامه پیدا می‌کند — ولی پورن‌هاب ممکن است با 403
+# ردش کند.
+try:
+    import curl_cffi  # noqa: F401
+    CURL_CFFI_AVAILABLE = True
+except ImportError:  # pragma: no cover - curl-cffi not installed
+    CURL_CFFI_AVAILABLE = False
+
+# yt-dlp از طریق Python API انتظار یک شیء ImpersonateTarget دارد؛
+# دادن رشته "chrome" در نسخه‌های جدید باعث AssertionError توی
+# YoutubeDL.__init__ می‌شود (CLI خودش رشته را تبدیل می‌کند، ولی API
+# نه). اگر ساخت آن نشد، impersonation خاموش می‌ماند.
+try:
+    from yt_dlp.networking.impersonate import (
+        ImpersonateTarget as _ImpersonateTarget,
+    )
+    _CHROME_IMPERSONATE_TARGET = _ImpersonateTarget.from_str("chrome")
+except Exception:  # pragma: no cover - old yt-dlp or import failure
+    _CHROME_IMPERSONATE_TARGET = None
 
 # ---------------------------------------------------------------------------
 # تنظیمات
@@ -266,9 +291,82 @@ def detect_platform(url: str) -> str | None:
 # دانلود با yt-dlp (بلوک‌کننده است؛ توی thread اجرا می‌شود)
 # ---------------------------------------------------------------------------
 
-def _download_once(url: str, height: int, outdir: str) -> tuple[str, list[Path]]:
-    """یک بار دانلود با سقف کیفیت height. برمی‌گرداند: (عنوان، فهرست فایل‌ها)."""
-    ydl_opts = {
+# ---------------------------------------------------------------------------
+# کوکی‌های اختیاری پورن‌هاب + تنظیمات yt-dlp (impersonation مرورگر)
+# ---------------------------------------------------------------------------
+
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
+# فایل کوکی پورن‌هاب روی Volume ریل‌وی؛ مسیرش با PORNHUB_COOKIES_FILE
+# قابل تغییر است (پیش‌فرض /data/cookies.txt).
+PORNHUB_COOKIES_FILE = Path(
+    os.environ.get("PORNHUB_COOKIES_FILE", "/data/cookies.txt")
+)
+_IMPERSONATION_WARNING_LOGGED = False
+
+
+def get_pornhub_cookiefile() -> str | None:
+    """مسیر فایل کوکی پورن‌هاب؛ None اگر چیزی نباشد.
+    اولویت:
+    ۱) متغیر PORNHUB_COOKIES — اگر مسیر یک فایل موجود باشد همان را
+       می‌دهد؛ اگر متن خام فایل کوکی (فرمت Netscape، با سطرهای
+       pornhub.com) باشد، آن را توی /data/pornhub_cookies.txt
+       می‌نویسد (یا اگر /data قابل نوشتن نبود، توی یک فایل موقت).
+    ۲) فایل /data/cookies.txt روی Volume ریل‌وی.
+    کوکی فقط برای پورن‌هاب استفاده می‌شود، نه اینستاگرام."""
+    env_value = os.environ.get("PORNHUB_COOKIES", "").strip()
+    if env_value:
+        if os.path.isfile(env_value):
+            return env_value
+        if "\n" in env_value and "pornhub.com" in env_value:
+            # متن خام فایل کوکی توی متغیر گذاشته شده؛ ذخیره‌اش کن.
+            try:
+                target = Path("/data/pornhub_cookies.txt")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(env_value, encoding="utf-8")
+                return str(target)
+            except OSError:
+                try:
+                    fd, tmp = tempfile.mkstemp(
+                        prefix="ph-cookies-", suffix=".txt"
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(env_value)
+                    return tmp
+                except OSError:
+                    pass
+        logger.warning(
+            "PORNHUB_COOKIES is set but is neither an existing file "
+            "nor cookie-file text; ignoring it."
+        )
+        return None
+    try:
+        if PORNHUB_COOKIES_FILE.is_file():
+            return str(PORNHUB_COOKIES_FILE)
+    except OSError:
+        pass
+    return None
+
+
+def _build_ydl_opts(url: str, height: int, outdir: str) -> dict:
+    """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای.
+    پورن‌هاب درخواست‌هایی که شبیه ربات‌اند (مثل IP دیتاسنتر ریل‌وی)
+    را با 403 رد می‌کند؛ impersonation با curl-cffi اثر انگشت TLS و
+    هدرهای مرورگر کروم را تقلید می‌کند. اگر curl-cffi نصب نباشد،
+    فقط هدرها و ری‌ترای‌ها اعمال می‌شوند و دانلود ادامه پیدا می‌کند."""
+    global _IMPERSONATION_WARNING_LOGGED
+    platform = detect_platform(url)
+    if platform == "pornhub":
+        referer = "https://www.pornhub.com/"
+    elif platform == "instagram":
+        referer = "https://www.instagram.com/"
+    else:
+        referer = "https://www.google.com/"
+
+    ydl_opts: dict = {
         "format": (
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"best[height<={height}][ext=mp4]/"
@@ -279,7 +377,45 @@ def _download_once(url: str, height: int, outdir: str) -> tuple[str, list[Path]]
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
+        # چند بار تلاش با فاصله؛ بلاک موقت (403/410) گاهی با تلاش
+        # دوباره رد می‌شود.
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "http_headers": {
+            "User-Agent": CHROME_USER_AGENT,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": referer,
+        },
     }
+
+    if CURL_CFFI_AVAILABLE and _CHROME_IMPERSONATE_TARGET is not None:
+        ydl_opts["impersonate"] = _CHROME_IMPERSONATE_TARGET
+    elif not _IMPERSONATION_WARNING_LOGGED:
+        _IMPERSONATION_WARNING_LOGGED = True
+        logger.warning(
+            "curl-cffi is not installed or ImpersonateTarget could not "
+            "be built; yt-dlp will run without browser impersonation "
+            "(Pornhub may return 403)."
+        )
+
+    if platform == "pornhub":
+        cookiefile = get_pornhub_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+            logger.info("Using Pornhub cookiefile: %s", cookiefile)
+
+    return ydl_opts
+
+
+def _download_once(url: str, height: int, outdir: str) -> tuple[str, list[Path]]:
+    """یک بار دانلود با سقف کیفیت height. برمی‌گرداند: (عنوان، فهرست فایل‌ها)."""
+    ydl_opts = _build_ydl_opts(url, height, outdir)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
