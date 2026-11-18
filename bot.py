@@ -6,9 +6,12 @@
 - اینستا: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
 - پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
   پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
-- فایل بزرگ: یک سشن مشترک Telethon برای همه کاربرها
-  (/data/telethon_session.txt یا TELETHON_SESSION_STRING) → تا ۲ گیگ
-  با MTProto؛ اگر نباشد، تقسیم با ffmpeg.
+- فایل بزرگ: اول فشرده می‌شود (ffmpeg، حداکثر ۴۸۰p) تا زیر ۴۸ مگ
+  جا شود و فقط اگر فشرده هم جا نشد تقسیم می‌شود. ارسال فقط با
+  خود ربات (Bot API) است؛ ارسال با حساب کاربری (Telethon/MTProto)
+  پیش‌فرض خاموش است و فقط اگر TELETHON_SEND_ENABLED=true ست شده
+  باشد استفاده می‌شود.
+- پیام پیشرفت هم درصد دانلود را نشان می‌دهد، هم درصد آپلود.
 - دانلودها در پس‌زمینه اجرا می‌شوند تا ربات به دستورهای دیگر
   جواب بدهد.
 - BOT_TOKEN از متغیر محیطی.
@@ -92,8 +95,9 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 
 
 class ProgressTracker:
-    """وضعیت دانلود yt-dlp؛ هوک از توی thread فقط چند عدد را به‌روز
-    می‌کند و یک تسک جداگانه پیام پیشرفت را ویرایش می‌کند."""
+    """وضعیت دانلود و آپلود؛ هوک yt-dlp و ارسال‌کننده‌ها از توی
+    thread فقط چند عدد را به‌روز می‌کنند و یک تسک جداگانه پیام
+    پیشرفت را ویرایش می‌کند."""
 
     def __init__(self) -> None:
         self.downloaded = 0
@@ -101,6 +105,12 @@ class ProgressTracker:
         self.speed = 0.0
         self.eta = 0
         self.started_at = time.monotonic()
+        # فاز فعلی: "download" یا "upload"
+        self.phase = "download"
+        self.upload_done_parts = 0
+        self.upload_total_parts = 0
+        self.upload_bytes = 0
+        self.upload_total_bytes = 0
 
     def hook(self, d: dict) -> None:
         if d.get("status") == "downloading":
@@ -114,13 +124,44 @@ class ProgressTracker:
             return 0
         return min(100, self.downloaded * 100 // self.total)
 
+    def begin_upload(self, total_parts: int, total_bytes: int) -> None:
+        """شروع فاز آپلود: درصد از اینجا به بعد درصد آپلود است."""
+        self.phase = "upload"
+        self.upload_total_parts = total_parts
+        self.upload_done_parts = 0
+        self.upload_total_bytes = total_bytes
+        self.upload_bytes = 0
 
-def _progress_text(pct: int) -> str:
-    """متن پیام پیشرفت: نوار لودینگ + درصد. کوتاه."""
+    def mark_upload_part_done(self, size: int) -> None:
+        self.upload_done_parts += 1
+        self.upload_bytes += int(size)
+
+    def upload_percent(self) -> int:
+        if self.upload_total_bytes:
+            return min(100, self.upload_bytes * 100 // self.upload_total_bytes)
+        if self.upload_total_parts:
+            return min(
+                100, self.upload_done_parts * 100 // self.upload_total_parts
+            )
+        return 0
+
+    def display_percent(self) -> int:
+        if self.phase == "upload":
+            return self.upload_percent()
+        return self.percent()
+
+    def display_text(self) -> str:
+        return _progress_text(self.display_percent(), self.phase)
+
+
+def _progress_text(pct: int, phase: str = "download") -> str:
+    """متن پیام پیشرفت: نوار لودینگ + درصد. کوتاه.
+    فاز دانلود ⏳ و فاز آپلود 📤 است."""
     pct = max(0, min(100, pct))
     filled = pct // 10
     bar = "▓" * filled + "░" * (10 - filled)
-    return f"⏳ {bar} {pct}٪"
+    icon = "📤" if phase == "upload" else "⏳"
+    return f"{icon} {bar} {pct}٪"
 
 
 # ---------------------------------------------------------------------------
@@ -191,16 +232,31 @@ def telethon_configured() -> bool:
     return bool(get_telethon_session_string())
 
 
+def telethon_send_enabled() -> bool:
+    """ارسال با Telethon فقط وقتی فعال است که صریحاً
+    TELETHON_SEND_ENABLED=true ست شده باشد. پیش‌فرض: خاموش —
+    ویدیوها فقط با خود ربات (Bot API) فرستاده می‌شوند، نه با
+    حساب کاربری."""
+    if os.environ.get(
+        "TELETHON_SEND_ENABLED", ""
+    ).strip().lower() not in ("true", "1", "yes"):
+        return False
+    return telethon_configured()
+
+
 async def send_via_telethon(chat_id: int, path: Path, caption: str | None,
-                            thumb: str | None = None) -> bool:
+                            thumb: str | None = None,
+                            tracker: ProgressTracker | None = None) -> bool:
     """
     فایل را با MTProto (حساب کاربری، سشن مشترک) به همان چت می‌فرستد.
-    سقف ۲ گیگابایت. در صورت هر خطایی False برمی‌گرداند تا مسیر
-    تقسیم استفاده شود.
+    سقف ۲ گیگابایت. فقط وقتی صدا زده می‌شود که
+    TELETHON_SEND_ENABLED=true باشد؛ پیش‌فرض خاموش است و ویدیوها
+    فقط با خود ربات فرستاده می‌شوند. در صورت هر خطایی False
+    برمی‌گرداند تا مسیر فشرده/تقسیم استفاده شود.
     نکته: حساب کاربری باید عضو گروه باشد (برای ارسال به گروه) یا با
     گیرنده دیالوگ داشته باشد (برای پی‌وی).
     """
-    if not telethon_configured():
+    if not telethon_send_enabled():
         return False
     creds = _telethon_api_credentials()
     session_str = get_telethon_session_string()
@@ -220,6 +276,14 @@ async def send_via_telethon(chat_id: int, path: Path, caption: str | None,
         kwargs = {"supports_streaming": True}
         if thumb:
             kwargs["thumb"] = thumb
+        if tracker is not None:
+            tracker.begin_upload(1, path.stat().st_size)
+
+            def _telethon_progress(current: int, total: int) -> None:
+                tracker.upload_bytes = int(current)
+                tracker.upload_total_bytes = int(total)
+
+            kwargs["progress_callback"] = _telethon_progress
         await client.send_file(
             chat_id,
             str(path),
@@ -249,7 +313,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 START_TEXT = """سلام! 👋
 لینک اینستاگرام یا پورن‌هاب رو بفرست تا دانلودش کنم.
 برای پورن‌هاب، بعد از فرستادن لینک کیفیت رو انتخاب می‌کنی.
-/makesession — برای فایل‌های بزرگ (فقط پی‌وی)"""
+/makesession — فقط پی‌وی"""
 
 TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
 
@@ -317,6 +381,9 @@ CHROME_USER_AGENT = (
 PORNHUB_COOKIES_FILE = Path(
     os.environ.get("PORNHUB_COOKIES_FILE", "/data/cookies.txt")
 )
+INSTAGRAM_COOKIES_FILE = Path(
+    os.environ.get("INSTAGRAM_COOKIES_FILE", "/data/instagram_cookies.txt")
+)
 _IMPERSONATION_WARNING_LOGGED = False
 
 
@@ -353,6 +420,46 @@ def get_pornhub_cookiefile() -> str | None:
     try:
         if PORNHUB_COOKIES_FILE.is_file():
             return str(PORNHUB_COOKIES_FILE)
+    except OSError:
+        pass
+    return None
+
+
+def get_instagram_cookiefile() -> str | None:
+    """مسیر فایل کوکی اینستاگرام؛ None اگر چیزی نباشد.
+    اینستاگرام IP دیتاسنتر را خیلی وقت‌ها بدون لاگین رد می‌کند؛
+    کوکی لاگین‌شده همان راه‌حلی است که برای پورن‌هاب جواب داد.
+    اولویت: متغیر INSTAGRAM_COOKIES (مسیر فایل یا متن خام فایل
+    کوکی)، بعد فایل /data/instagram_cookies.txt روی Volume ریل‌وی.
+    کوکی فقط برای اینستاگرام استفاده می‌شود، نه پورن‌هاب."""
+    env_value = os.environ.get("INSTAGRAM_COOKIES", "").strip()
+    if env_value:
+        if os.path.isfile(env_value):
+            return env_value
+        if "\n" in env_value and "instagram.com" in env_value:
+            try:
+                target = Path("/data/instagram_cookies.txt")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(env_value, encoding="utf-8")
+                return str(target)
+            except OSError:
+                try:
+                    fd, tmp = tempfile.mkstemp(
+                        prefix="ig-cookies-", suffix=".txt"
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(env_value)
+                    return tmp
+                except OSError:
+                    pass
+        logger.warning(
+            "INSTAGRAM_COOKIES is set but is neither an existing file "
+            "nor cookie-file text; ignoring it."
+        )
+        return None
+    try:
+        if INSTAGRAM_COOKIES_FILE.is_file():
+            return str(INSTAGRAM_COOKIES_FILE)
     except OSError:
         pass
     return None
@@ -411,6 +518,15 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None) -> dict:
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
             logger.info("Using Pornhub cookiefile: %s", cookiefile)
+
+    if platform == "instagram":
+        # impersonation کروم + هدرها همین‌طور برای اینستاگرام هم
+        # ست شده‌اند (بالا)؛ اینستاگرام IP دیتاسنتر را بدون لاگین
+        # رد می‌کند، پس کوکی لاگین‌شده راه‌حل دوم است.
+        cookiefile = get_instagram_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+            logger.info("Using Instagram cookiefile: %s", cookiefile)
 
     return ydl_opts
 
@@ -580,6 +696,69 @@ def _split_video_sync(path: Path, workdir: Path) -> list[Path]:
     return [p for p in parts if p.is_file() and p.stat().st_size > 0] or [path]
 
 
+def _compress_video_sync(path: Path, workdir: Path, height: int,
+                         crf: int) -> Path | None:
+    """ویدیو را با ffmpeg ریکد می‌کند (H.264، preset خیلی سریع،
+    صدا AAC ۹۶k). خروجی را برمی‌گرداند فقط اگر از فایل اصلی
+    کوچک‌تر بود؛ وگرنه None. کیفیت تماشایی می‌ماند."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    out = workdir / f"{path.stem}_c{height}.mp4"
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(path),
+                "-vf", f"scale=-2:{height}",
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", str(crf),
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart", str(out),
+            ],
+            capture_output=True, text=True, timeout=1200,
+        )
+    except Exception:
+        logger.exception("ffmpeg compress failed for %s", path)
+        return None
+    if (
+        r.returncode == 0 and out.is_file()
+        and 0 < out.stat().st_size < path.stat().st_size
+    ):
+        return out
+    try:
+        out.unlink()
+    except OSError:
+        pass
+    return None
+
+
+async def _fit_for_bot_api(path: Path, tmpdir: str) -> list[Path]:
+    """فایل را برای ارسال با Bot API جا می‌کند: اگر زیر ۴۸ مگ است
+    همان را برمی‌گرداند؛ وگرنه اول فشرده می‌کند (۴۸۰p با crf 28،
+    بعد ۳۶۰p با crf 30) تا یک فایل زیر ۴۸ مگ شود و فقط اگر فشرده
+    هم جا نشد تقسیم می‌کند. یک فایل فشرده خیلی سریع‌تر از چند
+    قسمت آپلود می‌شود."""
+    if path.stat().st_size <= MAX_BYTES:
+        return [path]
+    if path.suffix.lower() in VIDEO_EXTS:
+        workdir = Path(tmpdir) / f"compress-{path.stem}"
+        for height, crf in ((480, 28), (360, 30)):
+            compressed = await asyncio.to_thread(
+                _compress_video_sync, path, workdir, height, crf
+            )
+            if compressed is not None and compressed.stat().st_size <= MAX_BYTES:
+                logger.info(
+                    "Compressed %s (%d bytes) to %d bytes (%dp crf %d)",
+                    path, path.stat().st_size,
+                    compressed.stat().st_size, height, crf,
+                )
+                return [compressed]
+        logger.info("Compress did not fit %s; splitting", path)
+    parts_dir = Path(tmpdir) / f"parts-{path.stem}"
+    parts = await asyncio.to_thread(_split_video_sync, path, parts_dir)
+    if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
+        return parts
+    return [path]
+
+
 async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = False,
                                tracker=None):
     """
@@ -645,12 +824,12 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
         return "", [], False
     title, files = best_candidate
     main = max(files, key=lambda p: p.stat().st_size)
-    if main.suffix.lower() not in VIDEO_EXTS:
+    if main.stat().st_size <= MAX_BYTES:
         return title, files, False
-    parts_dir = Path(tmpdir) / "parts"
-    parts = await asyncio.to_thread(_split_video_sync, main, parts_dir)
-    if len(parts) > 1 and all(p.stat().st_size <= MAX_BYTES for p in parts):
-        return title, parts, True
+    # اول فشرده کن تا یک فایل زیر ۴۸ مگ شود؛ فقط اگر نشد تقسیم کن.
+    fitted = await _fit_for_bot_api(main, tmpdir)
+    if fitted != [main]:
+        return title, fitted, len(fitted) > 1
     return title, files, False
 
 
@@ -660,14 +839,21 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
 
 async def send_files(bot, chat_id: int, files: list[Path],
                      captions: list | None = None,
-                     thumb: Path | None = None) -> bool:
-    """فایل‌ها را می‌فرستد. captions هم‌طول files است.
-    thumb (کاور) فقط برای اولین ویدیو استفاده می‌شود.
-    اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند."""
+                     thumb: Path | None = None,
+                     tracker: ProgressTracker | None = None) -> bool:
+    """فایل‌ها را فقط با خود ربات (Bot API) می‌فرستد.
+    captions هم‌طول files است. thumb (کاور) فقط برای اولین ویدیو
+    استفاده می‌شود. اگر tracker داده شده باشد، قبل و بعد از هر
+    قسمت درصد آپلود را به‌روز می‌کند تا پیام پیشرفت آپلود را
+    نشان بدهد. اگر هیچ فایلی قابل ارسال نباشد False برمی‌گرداند."""
     if not files:
         return False
 
     captions = captions or [None] * len(files)
+    if tracker is not None:
+        tracker.begin_upload(
+            len(files), sum(p.stat().st_size for p in files)
+        )
     sent_any = False
     for i, path in enumerate(files):
         if path.stat().st_size > MAX_BYTES:
@@ -684,7 +870,7 @@ async def send_files(bot, chat_id: int, files: list[Path],
                         await bot.send_video(
                             chat_id=chat_id, video=f,
                             caption=caption, supports_streaming=True,
-                            thumb=thumb_f,
+                            thumbnail=thumb_f,
                         )
                 finally:
                     if thumb_f is not None:
@@ -703,6 +889,8 @@ async def send_files(bot, chat_id: int, files: list[Path],
                         chat_id=chat_id, document=f, caption=caption,
                     )
             sent_any = True
+            if tracker is not None:
+                tracker.mark_upload_part_done(path.stat().st_size)
         except Exception:
             logger.exception("send failed for %s", path)
 
@@ -711,13 +899,16 @@ async def send_files(bot, chat_id: int, files: list[Path],
 
 async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
                    files: list[Path], was_split: bool,
-                   caption_mode: str, thumb: Path | None = None) -> bool:
+                   caption_mode: str, thumb: Path | None = None,
+                   tracker: ProgressTracker | None = None) -> bool:
     """فایل‌های دانلودشده را می‌فرستد و True برمی‌گرداند اگر چیزی
-    فرستاده شد.
+    فرستاده شد. ارسال همیشه با خود ربات (Bot API) است.
     caption_mode: "instagram" → کپشن همه قسمت‌ها «@ربات ❤️»؛
     "title" → کپشن عنوان (قسمت‌ها با شماره قسمت).
-    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول با
-    Telethon (سشن مشترک)، بعد تقسیم با ffmpeg."""
+    ترتیب: ۱) فایل‌های کوچک با Bot API؛ ۲) فایل‌های بزرگ اول
+    فشرده می‌شوند تا یک فایل زیر ۴۸ مگ شوند و فقط اگر فشرده هم
+    جا نشد تقسیم می‌شوند. ارسال با حساب کاربری (Telethon) فقط
+    وقتی انجام می‌شود که TELETHON_SEND_ENABLED=true باشد."""
     if not files:
         return False
 
@@ -745,38 +936,39 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
             (await build_captions(len(files), was_split))[files.index(p)]
             for p in small
         ]
-        sent = await send_files(bot, chat_id, small, small_caps, thumb=thumb)
+        sent = await send_files(
+            bot, chat_id, small, small_caps, thumb=thumb, tracker=tracker
+        )
 
     for path in large:
-        if path.stat().st_size > TELETHON_MAX_BYTES:
-            continue
         caps = await build_captions(len(files), was_split)
         cap = caps[files.index(path)]
-        if telethon_configured():
+        # ارسال با حساب کاربری فقط وقتی صریحاً فعال شده باشد؛
+        # پیش‌فرض: ویدیو را فقط خود ربات می‌فرستد.
+        if (
+            telethon_send_enabled()
+            and path.stat().st_size <= TELETHON_MAX_BYTES
+        ):
             if await send_via_telethon(
                 chat_id, path, cap,
                 thumb=str(thumb) if thumb is not None else None,
+                tracker=tracker,
             ):
                 sent = True
                 continue
             logger.warning(
-                "Telethon send failed for %s; falling back to split",
+                "Telethon send failed for %s; falling back to compress/split",
                 path,
             )
-        if path.suffix.lower() in VIDEO_EXTS:
-            parts_dir = Path(tmpdir) / f"parts-{path.stem}"
-            parts = await asyncio.to_thread(
-                _split_video_sync, path, parts_dir
-            )
-            if len(parts) > 1 and all(
-                p.stat().st_size <= MAX_BYTES for p in parts
+        # فشرده‌سازی بعد تقسیم؛ هر دو فقط با Bot API فرستاده می‌شوند.
+        fitted = await _fit_for_bot_api(path, tmpdir)
+        fitted = [p for p in fitted if p.stat().st_size <= MAX_BYTES]
+        if fitted:
+            part_caps = await build_captions(len(fitted), len(fitted) > 1)
+            if await send_files(
+                bot, chat_id, fitted, part_caps, thumb=thumb, tracker=tracker
             ):
-                part_caps = await build_captions(len(parts), True)
-                if await send_files(
-                    bot, chat_id, parts, part_caps, thumb=thumb
-                ):
-                    sent = True
-                continue
+                sent = True
 
     return sent
 
@@ -786,14 +978,26 @@ async def _deliver(bot, chat_id: int, tmpdir: str, title: str,
 # ---------------------------------------------------------------------------
 
 async def do_instagram_download(bot, chat_id: int, url: str) -> str:
-    """دانلود اینستا. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'"""
-    status = await bot.send_message(chat_id=chat_id, text="⏳")
+    """دانلود اینستا. برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    پیام پیشرفت هم درصد دانلود و هم درصد آپلود را نشان می‌دهد."""
+    tracker = ProgressTracker()
+    done = asyncio.Event()
+    status = await bot.send_message(
+        chat_id=chat_id, text=_progress_text(0),
+    )
+    watcher = asyncio.create_task(
+        _watch_pornhub_progress(
+            bot, chat_id, status.message_id, tracker, done, False,
+        )
+    )
     try:
         async with DOWNLOAD_SEMAPHORE:
             with tempfile.TemporaryDirectory(prefix="dl-") as tmpdir:
                 try:
                     title, files, was_split = await download_best_effort(
-                        url, tmpdir, prefer_telethon=telethon_configured(),
+                        url, tmpdir,
+                        prefer_telethon=telethon_send_enabled(),
+                        tracker=tracker,
                     )
                 except Exception:
                     logger.exception("download failed for %s", url)
@@ -802,7 +1006,7 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
                     return "empty"
                 sent = await _deliver(
                     bot, chat_id, tmpdir, title, files, was_split,
-                    "instagram",
+                    "instagram", tracker=tracker,
                 )
                 if sent:
                     return "ok"
@@ -810,6 +1014,8 @@ async def do_instagram_download(bot, chat_id: int, url: str) -> str:
                     return "too_big"
                 return "empty"
     finally:
+        done.set()
+        watcher.cancel()
         try:
             await status.delete()
         except Exception:
@@ -820,25 +1026,26 @@ async def _watch_pornhub_progress(bot, chat_id: int, message_id: int,
                                   tracker: ProgressTracker,
                                   done: asyncio.Event,
                                   is_photo: bool) -> None:
-    """هر ۵ ثانیه پیام پیشرفت را با درصد فعلی ویرایش می‌کند."""
-    last_pct = -1
+    """هر ۵ ثانیه پیام پیشرفت را با درصد فعلی ویرایش می‌کند.
+    فاز دانلود ⏳ و فاز آپلود 📤 را نشان می‌دهد."""
+    last_text = ""
     try:
         while not done.is_set():
             await asyncio.sleep(5)
-            pct = tracker.percent()
-            if pct == last_pct:
+            text = tracker.display_text()
+            if text == last_text:
                 continue
-            last_pct = pct
+            last_text = text
             try:
                 if is_photo:
                     await bot.edit_message_caption(
                         chat_id=chat_id, message_id=message_id,
-                        caption=_progress_text(pct),
+                        caption=text,
                     )
                 else:
                     await bot.edit_message_text(
                         chat_id=chat_id, message_id=message_id,
-                        text=_progress_text(pct),
+                        text=text,
                     )
             except Exception:
                 pass
@@ -918,7 +1125,7 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
                 if not files:
                     title, files, was_split = await download_best_effort(
                         url, tmpdir,
-                        prefer_telethon=telethon_configured(),
+                        prefer_telethon=telethon_send_enabled(),
                         tracker=tracker,
                     )
                     if not files:
@@ -927,7 +1134,7 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
                 # ۵) ارسال (ویدیو با کاور)
                 sent = await _deliver(
                     bot, chat_id, tmpdir, title, files, was_split,
-                    "title", thumb=cover,
+                    "title", thumb=cover, tracker=tracker,
                 )
                 if sent:
                     return "ok"
