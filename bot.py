@@ -33,6 +33,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -40,8 +41,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import uuid
 from pathlib import Path
 
@@ -551,10 +553,14 @@ TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
 
 AGE_RESTRICTED_TEXT = "این ویدیو محدودیت سنی یا منطقه‌ای داره. 😕"
 
-# یوتیوب IP سرور را با چک ربات رد کرده (همه کلاینت‌ها با خطای
-# لاگین/ربات رد شده‌اند) — نه محدودیت سنی ویدیو، نه خطای عمومی؛
-# با کوکی لاگین‌شده یوتیوب درست می‌شود (بخش کوکی در README).
-BLOCKED_TEXT = "یوتیوب فعلاً سرور رو بلاک کرده؛ با کوکی درست می‌شه. 😕"
+# وب‌سرویس یوتیوب (GFw) درست ست نشده یا کلیدش مشکل دارد — کلید
+# فقط از متغیر محیطی GFWDEV_API_KEY می‌آید و هیچ‌جا هاردکد
+# نمی‌شود.
+GFW_KEY_MISSING_TEXT = "کلید وب‌سرویس یوتیوب تنظیم نشده. 😕"
+GFW_KEY_BAD_TEXT = "کلید وب‌سرویس یوتیوب مشکل داره. 😕"
+
+# وب‌سرویس می‌گوید ویدیو در دسترس نیست (حذف/خصوصی شده).
+YOUTUBE_UNAVAILABLE_TEXT = "این ویدیو در دسترس نیست. 😕"
 
 ERROR_TEXT = "نشد دانلودش کنم. 😕"
 
@@ -645,27 +651,11 @@ PORNHUB_COOKIES_FILE = Path(
 INSTAGRAM_COOKIES_FILE = Path(
     os.environ.get("INSTAGRAM_COOKIES_FILE", "/data/instagram_cookies.txt")
 )
-YOUTUBE_COOKIES_FILE = Path(
-    os.environ.get("YOUTUBE_COOKIES_FILE", "/data/youtube_cookies.txt")
-)
 
-# ترتیب کلاینت‌های پخش‌کننده یوتیوب برای اطلاعات و دانلود.
-# web اول است چون کامل‌ترین فرمت‌ها را می‌دهد (تا ۱۰۸۰p و بالاتر)؛
-# ولی روی IP دیتاسنتر (ریل‌وی) یوتیوب به کلاینت web خیلی وقت‌ها
-# صفحه «Sign in to confirm you're not a bot» می‌دهد و استخراج
-# با خطای فرمت/لاگین می‌افتد — آن خطا محدودیت سنی نیست، پس باید
-# با کلاینت‌های بعدی دوباره امتحان شود. android معمولاً رد
-# می‌شود ولی فقط تا ۳۶۰p فرمت دارد (format 18).
-# فهرست فقط کلاینت‌هایی را دارد که yt-dlp 2026.10.26 واقعاً
-# می‌شناسد (کلیدهای INNERTUBE_CLIENTS): اسم‌های قدیمی tv_embedded
-# و android_music و ios_music را این نسخه رد می‌کند («Skipping
-# unsupported client») و با آن‌ها عملاً دوباره web امتحان
-# می‌شود؛ به‌جایشان web_embedded (کلاینت embed واقعی، برای رد
-# کردن گیت سنی) و tv_samsung و tv_simply آمده‌اند.
-YOUTUBE_CLIENTS = (
-    "web", "android", "ios", "tv", "web_safari", "web_embedded",
-    "tv_samsung", "tv_simply", "web_music", "mweb",
-)
+# وب‌سرویس یوتیوب (GFw): دانلود یوتیوب دیگر با yt-dlp نیست و
+# کلید فقط از متغیر محیطی می‌آید — هیچ‌جا هاردکد نمی‌شود.
+GFWDEV_API_BASE = "https://api.gfwdev.ir/youtube"
+GFWDEV_API_KEY = os.environ.get("GFWDEV_API_KEY", "").strip()
 _IMPERSONATION_WARNING_LOGGED = False
 
 
@@ -747,56 +737,14 @@ def get_instagram_cookiefile() -> str | None:
     return None
 
 
-def get_youtube_cookiefile() -> str | None:
-    """مسیر فایل کوکی یوتیوب؛ None اگر چیزی نباشد.
-    فقط وقتی لازم است که همه کلاینت‌های پخش‌کننده (web/android/
-    ios/tv) رد شوند؛ کوکی لاگین‌شده آخرین راه‌حل است و اجباری
-    نیست. اولویت: متغیر YOUTUBE_COOKIES (مسیر فایل یا متن خام
-    فایل کوکی)، بعد فایل /data/youtube_cookies.txt روی Volume
-    ریل‌وی. کوکی فقط برای یوتیوب استفاده می‌شود."""
-    env_value = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if env_value:
-        if os.path.isfile(env_value):
-            return env_value
-        if "\n" in env_value and "youtube.com" in env_value:
-            try:
-                target = Path("/data/youtube_cookies.txt")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(env_value, encoding="utf-8")
-                return str(target)
-            except OSError:
-                try:
-                    fd, tmp = tempfile.mkstemp(
-                        prefix="yt-cookies-", suffix=".txt"
-                    )
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(env_value)
-                    return tmp
-                except OSError:
-                    pass
-        logger.warning(
-            "YOUTUBE_COOKIES is set but is neither an existing file "
-            "nor cookie-file text; ignoring it."
-        )
-        return None
-    try:
-        if YOUTUBE_COOKIES_FILE.is_file():
-            return str(YOUTUBE_COOKIES_FILE)
-    except OSError:
-        pass
-    return None
-
-
 def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None,
                     audio_only: bool = False,
-                    noplaylist: bool = True,
-                    youtube_client: str | None = None) -> dict:
+                    noplaylist: bool = True) -> dict:
     """تنظیمات yt-dlp: شبیه مرورگر واقعی + ری‌ترای.
-    audio_only=True یعنی فقط بهترین صدا و تبدیل به mp3 (یوتیوب
-    صوتی و ساندکلود). noplaylist=False فقط برای اسلایدشوی
-    عکس‌های تیک‌تاک استفاده می‌شود. youtube_client فقط برای
-    یوتیوب است (web/android/ios/tv) و بقیه پلتفرم‌ها را لمس
-    نمی‌کند."""
+    audio_only=True یعنی فقط بهترین صدا و تبدیل به mp3 (ساندکلود).
+    noplaylist=False فقط برای اسلایدشوی
+    عکس‌های تیک‌تاک استفاده می‌شود. یوتیوب دیگر از yt-dlp
+    استفاده نمی‌کند (وب‌سرویس GFw) و اینجا به آن دست نمی‌زنیم."""
     global _IMPERSONATION_WARNING_LOGGED
     platform = detect_platform(url)
     referer = _referer_for(url)
@@ -874,16 +822,6 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None,
             ydl_opts["cookiefile"] = cookiefile
             logger.info("Using Instagram cookiefile: %s", cookiefile)
 
-    if platform == "youtube":
-        if youtube_client:
-            ydl_opts["extractor_args"] = {
-                "youtube": {"player_client": [youtube_client]},
-            }
-        cookiefile = get_youtube_cookiefile()
-        if cookiefile:
-            ydl_opts["cookiefile"] = cookiefile
-            logger.info("Using YouTube cookiefile: %s", cookiefile)
-
     return ydl_opts
 
 
@@ -904,126 +842,6 @@ def _fetch_info_sync(url: str) -> dict | None:
     """اطلاعات ویدیو بدون دانلود فایل (عنوان + آدرس کاور)."""
     info, _err = _fetch_info_err_sync(url)
     return info
-
-
-def _is_age_or_region_error(err: str) -> bool:
-    """True فقط اگر خطای yt-dlp واقعاً به محدودیت سنی یا منطقه‌ای
-    اشاره کند — با عبارت‌های دقیق، نه زیررشته‌های کلی.
-    قبلاً زیررشته‌هایی مثل "age" و "sign in" و "country" هم
-    True می‌دادند؛ روی IP دیتاسنتر یوتیوب به کلاینت web برای
-    تقریباً همه ویدیوهای پابلیک هم صفحه «Sign in to confirm
-    you're not a bot» می‌دهد، پس همه ویدیوها اشتباهاً «محدودیت
-    سنی» تشخیص داده می‌شدند. آن خطا اینجا False است؛ فقط
-    عبارت‌های زیر True می‌دهند."""
-    low = (err or "").lower()
-    return any(
-        k in low
-        for k in (
-            "age-gated",
-            "age-gate",
-            "age-restricted",
-            "age restricted",
-            "age restriction",
-            "age_limit",
-            "age limit",
-            "sign in to confirm your age",
-            "not available in your country",
-            "blocked in your country",
-            "not available in your region",
-            "blocked in your region",
-        )
-    )
-
-
-def _is_signin_or_bot_error(err: str) -> bool:
-    """True اگر خطا از جنس چک لاگین/ربات یوتیوب باشد (نه محدودیت
-    سنی واقعی): «Sign in to confirm you're not a bot»، لاگین
-    عمومی، یا خطای فرمت که وقتی یوتیوب به‌جای ویدیو صفحه چک
-    می‌دهد رخ می‌دهد. این خطاها یعنی «با کلاینت بعدی دوباره
-    امتحان کن»، نه «ویدیو محدودیت سنی دارد». خطای واقعی سنی
-    اینجا False است (آن را _is_age_or_region_error تشخیص می‌دهد)."""
-    if _is_age_or_region_error(err):
-        return False
-    low = (err or "").lower()
-    return any(
-        k in low
-        for k in (
-            "sign in to confirm you're not a bot",
-            "confirm you're not a bot",
-            "confirm you are not a bot",
-            "sign in to confirm",
-            "please sign in",
-            "login required",
-            "log in",
-            "sign in",
-            "requested format is not available",
-            "the page needs to be reloaded",
-        )
-    )
-
-
-def _youtube_verdict(errors: list[str], exhausted: bool) -> str:
-    """نتیجه نهایی یوتیوب از روی خطاهای همه کلاینت‌ها:
-    همه سنی/منطقه‌ای → "age"؛ همه چک لاگین/ربات → "blocked"؛
-    بقیه (از جمله مخلوط) → "error". exhausted یعنی حلقه همه
-    کلاینت‌هایش را امتحان کرده و وسط راه با خطای دیگری نبریده
-    است؛ اگر حلقه زود بریده باشد یا خطایی نباشد، نتیجه "error"
-    است. ترتیب مهم است: خطای واقعی سنی در _is_signin_or_bot_error
-    همیشه False است، پس فهرستِ همه‌سنی فقط به "age" می‌رسد."""
-    if not exhausted or not errors:
-        return "error"
-    if all(_is_age_or_region_error(e) for e in errors):
-        return "age"
-    if all(_is_signin_or_bot_error(e) for e in errors):
-        return "blocked"
-    return "error"
-
-
-def _youtube_client_order(start_client: str | None = None) -> list[str]:
-    """ترتیب کلاینت‌های یوتیوب از کلاینت شروع به بعد؛ اگر کلاینت
-    شروع معلوم نباشد، همه به ترتیب YOUTUBE_CLIENTS."""
-    order = list(YOUTUBE_CLIENTS)
-    if start_client in order:
-        return order[order.index(start_client):]
-    return order
-
-
-def _fetch_youtube_info_err_sync(
-    url: str,
-) -> tuple[dict | None, str, str | None, list[str]]:
-    """اطلاعات ویدیوی یوتیوب بدون دانلود، با fallback کلاینت‌های
-    پخش‌کننده (به ترتیب YOUTUBE_CLIENTS: web، android، ios، tv،
-    web_safari، web_embedded، tv_samsung، tv_simply، web_music،
-    mweb). اولین موفقی را با همان کلاینت برمی‌گرداند. اگر همه رد
-    شدند، (None، آخرین خطا، None، فهرست خطای هر کلاینت) می‌دهد —
-    تصمیم «سنی/منطقه‌ای، بلاک سرور، یا خطای عمومی» با فراخوان
-    است (تابع _youtube_verdict)، نه اینجا."""
-    last_err = ""
-    errors: list[str] = []
-    for client in YOUTUBE_CLIENTS:
-        try:
-            ydl_opts = _build_ydl_opts(
-                url, 720, tempfile.gettempdir(),
-                youtube_client=client,
-            )
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if isinstance(info, dict):
-                logger.info(
-                    "YouTube info OK via player_client=%s for %s",
-                    client, url,
-                )
-                return info, "", client, errors
-            last_err = "empty info"
-            errors.append(last_err)
-        except Exception as e:
-            last_err = str(e)
-            errors.append(last_err)
-            logger.warning(
-                "YouTube info failed via player_client=%s for %s: %s",
-                client, url, last_err[:200],
-            )
-    return None, last_err, None, errors
 
 
 def parse_soundcloud_track(info: dict) -> tuple[str, str]:
@@ -1252,7 +1070,7 @@ def _download_cover_sync(thumb_url: str | None, tmpdir: str,
         return None
 
 
-def _probe_height_sync(url: str, youtube_client: str | None = None) -> int | None:
+def _probe_height_sync(url: str) -> int | None:
     """بدون دانلود فایل، حجم تقریبی هر کیفیت را می‌پرسد و بالاترین
     کیفیتی که زیر ۴۸ مگ جا می‌شود را برمی‌گرداند. None یعنی حجم
     معلوم نشد."""
@@ -1260,7 +1078,6 @@ def _probe_height_sync(url: str, youtube_client: str | None = None) -> int | Non
         try:
             ydl_opts = _build_ydl_opts(
                 url, height, tempfile.gettempdir(),
-                youtube_client=youtube_client,
             )
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -1278,11 +1095,10 @@ def _probe_height_sync(url: str, youtube_client: str | None = None) -> int | Non
 
 
 def _download_once(url: str, height: int, outdir: str, tracker=None,
-                   youtube_client: str | None = None) -> tuple[str, list[Path]]:
+                   ) -> tuple[str, list[Path]]:
     """یک بار دانلود با سقف کیفیت height. برمی‌گرداند: (عنوان، فهرست فایل‌ها)."""
     ydl_opts = _build_ydl_opts(
         url, height, outdir, tracker=tracker,
-        youtube_client=youtube_client,
     )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1303,12 +1119,11 @@ def _download_once(url: str, height: int, outdir: str, tracker=None,
 
 
 def _download_audio_once(url: str, outdir: str, tracker=None,
-                         youtube_client: str | None = None) -> tuple[str, list[Path]]:
-    """فقط بهترین صدا را دانلود و به mp3 تبدیل می‌کند (یوتیوب
-    صوتی و ساندکلود). برمی‌گرداند: (عنوان، فهرست فایل‌های mp3)."""
+                         ) -> tuple[str, list[Path]]:
+    """فقط بهترین صدا را دانلود و به mp3 تبدیل می‌کند (ساندکلود).
+    برمی‌گرداند: (عنوان، فهرست فایل‌های mp3)."""
     ydl_opts = _build_ydl_opts(
         url, 720, outdir, tracker=tracker, audio_only=True,
-        youtube_client=youtube_client,
     )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -1503,8 +1318,7 @@ async def _fit_for_bot_api(path: Path, tmpdir: str,
 
 
 async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = False,
-                               tracker=None,
-                               youtube_client: str | None = None):
+                               tracker=None):
     """
     دانلود با کیفیتی که از قبل اندازه‌اش معلوم شده (probe).
     برمی‌گرداند: (title, files, was_split)
@@ -1512,8 +1326,6 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
     fallback می‌ماند. اگر prefer_telethon=True باشد، مستقیم ۷۲۰p
     دانلود می‌شود تا اول با Telethon bot client (خود ربات، تا ۲ گیگ)
     فرستاده شود؛ اینجا هیچ تقسیمی انجام نمی‌شود.
-    youtube_client فقط برای یوتیوب است و از همان کلاینتِ موفقِ
-    اطلاعات استفاده می‌کند (بقیه پلتفرم‌ها None می‌گیرند).
     """
     if prefer_telethon:
         subdir = Path(tmpdir) / "h720"
@@ -1521,7 +1333,6 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
         try:
             title, files = await asyncio.to_thread(
                 _download_once, url, 720, str(subdir), tracker,
-                youtube_client,
             )
         except Exception:
             logger.exception("yt-dlp failed at 720p for %s", url)
@@ -1529,7 +1340,7 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
         return title, files, False
 
     probe_height = await asyncio.to_thread(
-        _probe_height_sync, url, youtube_client
+        _probe_height_sync, url
     )
     if probe_height is not None:
         logger.info("Probe chose %dp for %s", probe_height, url)
@@ -1538,7 +1349,6 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
         try:
             title, files = await asyncio.to_thread(
                 _download_once, url, probe_height, str(subdir), tracker,
-                youtube_client,
             )
         except Exception:
             logger.exception(
@@ -1557,7 +1367,6 @@ async def download_best_effort(url: str, tmpdir: str, prefer_telethon: bool = Fa
         try:
             title, files = await asyncio.to_thread(
                 _download_once, url, height, str(subdir), tracker,
-                youtube_client,
             )
         except Exception:
             logger.exception("yt-dlp failed at %dp for %s", height, url)
@@ -2067,25 +1876,311 @@ async def do_pornhub_download(bot, chat_id: int, url: str,
                     pass
 
 
+# ---------------------------------------------------------------------------
+# دانلود یوتیوب با وب‌سرویس GFw (به‌جای yt-dlp)
+# ---------------------------------------------------------------------------
+# یوتیوب روی IP دیتاسنتر (ریل‌وی) با yt-dlp کامل بلاک بود: همه
+# کلاینت‌های پخش‌کننده صفحه «Sign in to confirm you're not a
+# bot» می‌دادند و حتی با کوکی هم Shorts خطا می‌داد. پس یوتیوب
+# حالا از وب‌سرویس GFw می‌آید: یک GET با quality=best همه
+# کیفیت‌ها را برمی‌گرداند و لینک‌های مستقیم googlevideo را
+# می‌دهد که به IP قفل نیستند (از IP دیگر هم ۲۰۶ می‌دهند).
+# نکته مهم: همه ویدیوها adaptive و فقط-تصویر هستند (itagهای
+# ۱۳۶/۱۳۷ و…) — هیچ itag progressive (۱۸/۲۲) با صدا نیست؛ پس
+# ویدیو حتماً باید با بهترین صدا میکس شود (ffmpeg -c copy،
+# بدون ریکد)، وگرنه ویدیوی بی‌صدا فرستاده می‌شود. اگر دانلود
+# صدا یا میکس نشد، خطا برمی‌گردد و ویدیوی بی‌صدا فرستاده
+# نمی‌شود. لینک‌های googlevideo حدود ۶ ساعت اعتبار دارند، پس
+# دانلود باید همان‌موقع شروع شود.
+# کلید فقط از متغیر محیطی GFWDEV_API_KEY می‌آید و هیچ‌جا
+# هاردکد یا لاگ نمی‌شود.
+
+# itagهای progressive یوتیوب (صدا+تصویر با هم) — اگر وب‌سرویس
+# روزی یکی از این‌ها را برگرداند، ویدیو خودش صدا دارد و نیازی
+# به میکس با صدای جدا نیست.
+_PROGRESSIVE_ITAGS = {18, 22, 37, 43}
+
+
+def _gfw_itag(url: str) -> int | None:
+    """itag را از کوئری لینک googlevideo می‌خواند؛ None اگر نباشد."""
+    try:
+        values = parse_qs(urlparse(url or "").query).get("itag")
+        return int(values[0]) if values else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _gfw_needs_audio_mux(video_entry: dict) -> bool:
+    """True اگر ویدیوی انتخاب‌شده صدا ندارد و باید با صدای جدا
+    میکس شود. itag معلوم نباشد هم True می‌دهد (محتاطانه: میکس
+    با صدای جدا ضرری ندارد)."""
+    itag = _gfw_itag(str(video_entry.get("url") or ""))
+    return itag not in _PROGRESSIVE_ITAGS
+
+
+def _gfw_api_error_code(msg: str, http_status: int | None) -> str:
+    """پیام خطای وب‌سرویس را به کد کوتاه نتیجه تبدیل می‌کند:
+    "age" | "bad_key" | "unavailable" | "error"."""
+    low = (msg or "").lower()
+    if any(k in low for k in (
+        "age-restricted", "age-gated", "age restriction",
+        "age limit", "confirm your age", "age verification",
+    )):
+        return "age"
+    if http_status in (401, 403) or any(k in low for k in (
+        "api_key", "api key", "invalid key", "invalid api",
+        "unauthorized", "license", "expired key", "forbidden",
+    )):
+        return "bad_key"
+    if any(k in low for k in (
+        "unavailable", "private", "not found", "removed",
+        "deleted", "no longer available", "video not found",
+    )):
+        return "unavailable"
+    return "error"
+
+
+def _gfw_youtube_info_sync(
+    url: str, api_key: str, timeout: int = 60
+) -> tuple[dict | None, str]:
+    """اطلاعات یوتیوب را از وب‌سرویس GFw می‌گیرد (فقط stdlib).
+    برمی‌گرداند: (data یا None، کد خطا یا "").
+    کد خطا: "no_key" (کلید ست نشده) | "bad_key" (کلید نامعتبر)
+    | "unavailable" (ویدیو در دسترس نیست) | "age" | "error"."""
+    if not api_key:
+        return None, "no_key"
+    api_url = (
+        f"{GFWDEV_API_BASE}?url={quote(url, safe='')}"
+        f"&api_key={quote(api_key, safe='')}&quality=best"
+    )
+    req = urllib.request.Request(
+        api_url, headers={"User-Agent": CHROME_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+            try:
+                msg = str(json.loads(body).get("message") or "")
+            except Exception:
+                msg = body
+        except Exception:
+            pass
+        logger.warning(
+            "GFw YouTube API HTTP %s for %s: %s", e.code, url, msg[:200]
+        )
+        return None, _gfw_api_error_code(msg, e.code)
+    except Exception:
+        logger.exception("GFw YouTube API request failed for %s", url)
+        return None, "error"
+    if status != 200:
+        return None, "error"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        logger.warning("GFw YouTube API returned invalid JSON for %s", url)
+        return None, "error"
+    if not isinstance(payload, dict):
+        return None, "error"
+    if not payload.get("status"):
+        return None, _gfw_api_error_code(
+            str(payload.get("message") or ""), None
+        )
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(
+        data.get("downloads"), dict
+    ):
+        return None, "error"
+    return data, ""
+
+
+def _gfw_pick_video(entries: list, height: int) -> dict | None:
+    """بهترین ویدیوی mp4: اول همان ارتفاع دقیق، بعد بالاترین
+    mp4 تا ارتفاع خواسته‌شده، بعد پایین‌ترین mp4. None اگر
+    هیچ mp4ای نباشد."""
+    mp4s: list[tuple[int, dict]] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("format") or "").lower() != "mp4":
+            continue
+        try:
+            h = int(str(e.get("quality") or "").strip().rstrip("p"))
+        except ValueError:
+            continue
+        if h > 0 and e.get("url"):
+            mp4s.append((h, e))
+    if not mp4s:
+        return None
+    for h, e in mp4s:
+        if h == height:
+            return e
+    below = [(h, e) for h, e in mp4s if h < height]
+    if below:
+        return max(below, key=lambda t: t[0])[1]
+    return min(mp4s, key=lambda t: t[0])[1]
+
+
+def _gfw_audio_kbps(entry: dict) -> int:
+    """بیت‌ریت صدا از quality (مثل "129kbps")؛ ۰ اگر معلوم نباشد."""
+    try:
+        return int(
+            str(entry.get("quality") or "").lower()
+            .replace("kbps", "").strip()
+        )
+    except ValueError:
+        return 0
+
+
+def _gfw_pick_audio(entries: list) -> dict | None:
+    """بهترین صدا: اول m4a با بالاترین بیت‌ریت (معمولاً itag 140
+    با 129kbps)، وگرنه بالاترین بیت‌ریت webm. None اگر صدایی
+    نباشد."""
+    best: dict | None = None
+    best_key: tuple[int, int] | None = None
+    for e in entries or []:
+        if not isinstance(e, dict) or not e.get("url"):
+            continue
+        fmt = (e.get("format") or "").lower()
+        key = (1 if fmt == "m4a" else 0, _gfw_audio_kbps(e))
+        if best is None or key > best_key:
+            best, best_key = e, key
+    return best
+
+
+def _download_url_sync(url: str, dest: Path, tracker=None,
+                       total_size: int | None = None,
+                       attempts: int = 3) -> bool:
+    """یک فایل را با urllib استریم دانلود می‌کند (لینک مستقیم
+    googlevideo)؛ درصد/سرعت/ETA توی ترکر می‌آید (فاز دانلود).
+    تا ۳ بار دوباره امتحان می‌کند؛ True اگر فایل کامل آمد."""
+    for attempt in range(1, attempts + 1):
+        try:
+            if dest.is_file():
+                dest.unlink()
+        except OSError:
+            pass
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": CHROME_USER_AGENT,
+                    "Referer": "https://www.youtube.com/",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = total_size or 0
+                try:
+                    total = total or int(
+                        resp.headers.get("Content-Length") or 0
+                    )
+                except (ValueError, TypeError):
+                    total = total_size or 0
+                if tracker is not None:
+                    tracker.set_phase("download", 0)
+                    tracker.total = total
+                    tracker.downloaded = 0
+                    tracker.speed = 0.0
+                    tracker.eta = 0
+                start = time.monotonic()
+                downloaded = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if tracker is not None:
+                            elapsed = time.monotonic() - start
+                            tracker.downloaded = downloaded
+                            tracker.speed = (
+                                downloaded / elapsed if elapsed > 0 else 0
+                            )
+                            if total and tracker.speed > 0:
+                                tracker.eta = int(
+                                    (total - downloaded) / tracker.speed
+                                )
+            if dest.is_file() and dest.stat().st_size > 0:
+                if total and dest.stat().st_size < total:
+                    logger.warning(
+                        "Download incomplete for %s: %d of %d bytes",
+                        dest, dest.stat().st_size, total,
+                    )
+                    continue
+                return True
+            logger.warning("Download gave empty file for %s", dest)
+        except urllib.error.HTTPError as e:
+            # لینک منقضی/ردشده (403/404/410) با retry درست نمی‌شود.
+            logger.warning(
+                "Download HTTP %s for %s (attempt %d/%d)",
+                e.code, url, attempt, attempts,
+            )
+            if e.code in (403, 404, 410):
+                return False
+        except Exception:
+            logger.exception(
+                "Download failed for %s (attempt %d/%d)",
+                url, attempt, attempts,
+            )
+    return False
+
+
+def _mux_video_audio_sync(video: Path, audio: Path, out: Path,
+                          duration_s: float | None = None,
+                          tracker=None) -> int:
+    """ویدیوی فقط-تصویر + صدای جدا را با ffmpeg -c copy (بدون
+    ریکد، سریع) به یک mp4 میکس می‌کند. کد بازگشت ffmpeg را
+    برمی‌گرداند (۰ یعنی موفق)."""
+    return _run_ffmpeg_progress(
+        [
+            "ffmpeg", "-y",
+            "-i", str(video), "-i", str(audio),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c", "copy", "-movflags", "+faststart",
+            str(out),
+        ],
+        duration_s, tracker, "info",
+    )
+
+
+def _convert_audio_to_mp3_sync(audio_in: Path, out: Path,
+                               duration_s: float | None = None,
+                               tracker=None) -> int:
+    """صدا (m4a/webm) را به mp3 تبدیل می‌کند. کد بازگشت ffmpeg
+    را برمی‌گرداند (۰ یعنی موفق)."""
+    return _run_ffmpeg_progress(
+        [
+            "ffmpeg", "-y", "-i", str(audio_in),
+            "-codec:a", "libmp3lame", "-q:a", "2",
+            str(out),
+        ],
+        duration_s, tracker, "info",
+    )
+
+
 async def do_youtube_download(bot, chat_id: int, url: str,
                               height: int, audio: bool = False) -> str:
-    """دانلود یوتیوب — دقیقاً مثل پورن‌هاب: اول اطلاعات + کاور،
-    پیام پیشرفت با عکس کاور که هر ۵ ثانیه ویرایش می‌شود، بعد
-    دانلود با کیفیت انتخاب‌شده و ارسال ویدیو با همان کاور
-    به‌عنوان thumbnail. اگر audio=True باشد، فقط بهترین صدا
-    دانلود و به mp3 تبدیل می‌شود و با عنوان ویدیو فرستاده می‌شود.
-    اطلاعات و دانلود با fallback کلاینت‌های پخش‌کننده یوتیوب
-    انجام می‌شود (به ترتیب YOUTUBE_CLIENTS — ده کلاینت): روی IP
-    دیتاسنتر کلاینت web خیلی وقت‌ها صفحه «Sign in to confirm
-    you're not a bot» می‌دهد و آن خطا محدودیت سنی نیست — پس
-    با کلاینت بعدی دوباره امتحان می‌شود. «age» فقط وقتی
-    برمی‌گردد که همه کلاینت‌ها رد شوند و خطا واقعاً سنی یا
-    منطقه‌ای باشد؛ اگر همه با چک ربات رد شوند، "blocked"
-    برمی‌گردد (یوتیوب سرور را بلاک کرده و فقط با کوکی درست
-    می‌شود).
-    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age' | 'blocked'
-    ('age' یعنی ویدیو محدودیت سنی یا منطقه‌ای دارد؛ 'blocked'
-    یعنی یوتیوب همه کلاینت‌ها را با چک ربات رد کرده است)."""
+    """دانلود یوتیوب با وب‌سرویس GFw — دقیقاً مثل پورن‌هاب: اول
+    اطلاعات + کاور، پیام پیشرفت با عکس کاور که هر ۵ ثانیه
+    ویرایش می‌شود، بعد دانلود با کیفیت انتخاب‌شده و ارسال
+    ویدیو با همان کاور به‌عنوان thumbnail. اگر audio=True
+    باشد، فقط بهترین صدا دانلود و به mp3 تبدیل می‌شود و با
+    عنوان ویدیو فرستاده می‌شود.
+    وب‌سرویس همه ویدیوها را فقط-تصویر (adaptive) می‌دهد، پس
+    ویدیو حتماً با بهترین صدا میکس می‌شود (ffmpeg -c copy،
+    بدون ریکد)؛ اگر دانلود صدا یا میکس نشد، خطا برمی‌گردد و
+    ویدیوی بی‌صدا فرستاده نمی‌شود.
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'age'
+    | 'no_key' | 'bad_key' | 'unavailable'
+    ('no_key' یعنی کلید وب‌سرویس ست نشده؛ 'bad_key' یعنی کلید
+    مشکل دارد؛ 'unavailable' یعنی ویدیو در دسترس نیست)."""
+    if not GFWDEV_API_KEY:
+        return "no_key"
     with tempfile.TemporaryDirectory(prefix="yt-") as tmpdir:
         tracker = ProgressTracker()
         done = asyncio.Event()
@@ -2114,25 +2209,25 @@ async def do_youtube_download(bot, chat_id: int, url: str,
                 progress_msg = None
                 logger.exception("Could not send progress message")
 
-            # ۱) اطلاعات + کاور (بدون دانلود ویدیو) — با fallback
-            # کلاینت‌های یوتیوب (به ترتیب YOUTUBE_CLIENTS). نتیجه
-            # را _youtube_verdict از روی خطای همه کلاینت‌ها
-            # می‌سازد: همه سنی/منطقه‌ای → "age"، همه چک ربات →
-            # "blocked"، بقیه → "error".
-            info, info_err, yt_client, info_errors = await asyncio.to_thread(
-                _fetch_youtube_info_err_sync, url
+            # ۱) اطلاعات + کاور از وب‌سرویس GFw.
+            data, err = await asyncio.to_thread(
+                _gfw_youtube_info_sync, url, GFWDEV_API_KEY
             )
-            if info is None:
-                return _youtube_verdict(info_errors, True)
-            title = str((info or {}).get("title") or "")
-            performer = str(
-                (info or {}).get("uploader")
-                or (info or {}).get("channel") or ""
-            )
+            if data is None:
+                return err
+            title = str(data.get("title") or "")
+            performer = str(data.get("channel") or "")
+            duration_s: float | None = None
+            try:
+                duration_s = float(data.get("duration") or 0) or None
+            except (TypeError, ValueError):
+                duration_s = None
+            downloads = data.get("downloads") or {}
             cover = None
-            if info:
+            thumb_url = data.get("thumbnail")
+            if thumb_url:
                 cover = await asyncio.to_thread(
-                    _download_cover_sync, info.get("thumbnail"), tmpdir,
+                    _download_cover_sync, thumb_url, tmpdir,
                     "https://www.youtube.com/",
                 )
 
@@ -2161,97 +2256,74 @@ async def do_youtube_download(bot, chat_id: int, url: str,
             audio_duration: int | None = None
 
             if audio:
-                # صوتی: بهترین صدا → mp3 — اگر دانلود با کلاینت
-                # موفقِ اطلاعات با خطای لاگین/ربات رد شد، با
-                # کلاینت‌های بعدی دوباره امتحان می‌شود.
+                # صوتی: بهترین صدا → mp3.
+                entry = _gfw_pick_audio(downloads.get("audio") or [])
+                if entry is None or not entry.get("url"):
+                    return "error"
                 subdir = Path(tmpdir) / "audio"
                 subdir.mkdir(parents=True, exist_ok=True)
-                files = []
-                dl_errors: list[str] = []
-                dl_broke_early = False
-                for _client in _youtube_client_order(yt_client):
-                    try:
-                        dl_title, files = await asyncio.to_thread(
-                            _download_audio_once, url, str(subdir),
-                            tracker, _client,
-                        )
-                        if dl_title:
-                            title = dl_title
-                        break
-                    except Exception as e:
-                        if (_is_signin_or_bot_error(str(e))
-                                or _is_age_or_region_error(str(e))):
-                            logger.warning(
-                                "yt-dlp audio failed via player_client=%s "
-                                "for %s; trying next client",
-                                _client, url,
-                            )
-                            dl_errors.append(str(e))
-                            files = []
-                            continue
-                        logger.exception("yt-dlp audio failed for %s", url)
-                        files = []
-                        dl_broke_early = True
-                        break
-                if not files:
-                    return _youtube_verdict(dl_errors, not dl_broke_early)
+                fmt = (entry.get("format") or "m4a").lower()
+                raw = subdir / f"audio.{fmt}"
+                size = entry.get("size")
+                ok = await asyncio.to_thread(
+                    _download_url_sync, str(entry["url"]), raw, tracker,
+                    int(size) if isinstance(size, int) else None,
+                )
+                if not ok:
+                    return "error"
+                mp3 = subdir / "audio.mp3"
+                rc = await asyncio.to_thread(
+                    _convert_audio_to_mp3_sync, raw, mp3, duration_s,
+                    tracker,
+                )
+                if rc != 0 or not mp3.is_file() or mp3.stat().st_size == 0:
+                    logger.warning("Audio mp3 conversion failed for %s", url)
+                    return "error"
+                files = [mp3]
             else:
-                # ۲٫۵) اول لینک مستقیم امتحان می‌شود؛ اگر نشد
-                # می‌رویم سراغ دانلود معمولی.
-                if info:
-                    if await _try_direct_url_send(
-                        bot, chat_id, info, height,
-                        title[:200] if title else None, cover, tracker,
-                    ):
-                        return "ok"
-
-                # ۳) دانلود با کیفیت انتخاب‌شده — اگر با کلاینت
-                # موفقِ اطلاعات با خطای لاگین/ربات رد شد، با
-                # کلاینت‌های بعدی دوباره امتحان می‌شود.
+                # ویدیو: کیفیت انتخاب‌شده (mp4) + بهترین صدا، میکس‌شده.
+                ventry = _gfw_pick_video(downloads.get("video") or [], height)
+                if ventry is None or not ventry.get("url"):
+                    return "error"
                 subdir = Path(tmpdir) / f"h{height}"
                 subdir.mkdir(parents=True, exist_ok=True)
-                files = []
-                dl_errors: list[str] = []
-                dl_broke_early = False
-                for _client in _youtube_client_order(yt_client):
-                    try:
-                        dl_title, files = await asyncio.to_thread(
-                            _download_once, url, height, str(subdir),
-                            tracker, _client,
-                        )
-                        if dl_title:
-                            title = dl_title
-                        break
-                    except Exception as e:
-                        if (_is_signin_or_bot_error(str(e))
-                                or _is_age_or_region_error(str(e))):
-                            logger.warning(
-                                "yt-dlp failed at %dp via player_client=%s "
-                                "for %s; trying next client",
-                                height, _client, url,
-                            )
-                            dl_errors.append(str(e))
-                            files = []
-                            continue
-                        logger.exception(
-                            "yt-dlp failed at %dp for %s", height, url
-                        )
-                        files = []
-                        dl_broke_early = True
-                        break
-
-                # ۴) اگر نشد، fallback به نردبان کیفیت
-                if not files:
-                    title, files, was_split = await download_best_effort(
-                        url, tmpdir,
-                        prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
-                        tracker=tracker,
-                        youtube_client=yt_client,
+                vfmt = (ventry.get("format") or "mp4").lower()
+                vpath = subdir / f"video.{vfmt}"
+                vsize = ventry.get("size")
+                ok = await asyncio.to_thread(
+                    _download_url_sync, str(ventry["url"]), vpath, tracker,
+                    int(vsize) if isinstance(vsize, int) else None,
+                )
+                if not ok:
+                    return "error"
+                if _gfw_needs_audio_mux(ventry):
+                    aentry = _gfw_pick_audio(downloads.get("audio") or [])
+                    if aentry is None or not aentry.get("url"):
+                        return "error"
+                    afmt = (aentry.get("format") or "m4a").lower()
+                    apath = subdir / f"audio.{afmt}"
+                    asize = aentry.get("size")
+                    ok = await asyncio.to_thread(
+                        _download_url_sync, str(aentry["url"]), apath,
+                        tracker,
+                        int(asize) if isinstance(asize, int) else None,
                     )
-                    if not files:
-                        return _youtube_verdict(
-                            dl_errors, not dl_broke_early
+                    if not ok:
+                        return "error"
+                    merged = subdir / "video.mp4"
+                    rc = await asyncio.to_thread(
+                        _mux_video_audio_sync, vpath, apath, merged,
+                        duration_s, tracker,
+                    )
+                    if rc != 0 or not merged.is_file() \
+                            or merged.stat().st_size == 0:
+                        logger.warning(
+                            "Video/audio mux failed for %s", url
                         )
+                        return "error"
+                    files = [merged]
+                else:
+                    files = [vpath]
 
             # ۵) ارسال (ویدیو با کاور / آهنگ با عنوان و خواننده)
             if files and files[0].suffix.lower() == ".mp3":
@@ -2472,8 +2544,14 @@ async def _background_download(bot, chat_id: int, url: str,
             await bot.send_message(chat_id=chat_id, text=TOO_BIG_TEXT)
         elif result == "age":
             await bot.send_message(chat_id=chat_id, text=AGE_RESTRICTED_TEXT)
-        elif result == "blocked":
-            await bot.send_message(chat_id=chat_id, text=BLOCKED_TEXT)
+        elif result == "no_key":
+            await bot.send_message(chat_id=chat_id, text=GFW_KEY_MISSING_TEXT)
+        elif result == "bad_key":
+            await bot.send_message(chat_id=chat_id, text=GFW_KEY_BAD_TEXT)
+        elif result == "unavailable":
+            await bot.send_message(
+                chat_id=chat_id, text=YOUTUBE_UNAVAILABLE_TEXT
+            )
         elif result in ("empty", "error"):
             await bot.send_message(chat_id=chat_id, text=ERROR_TEXT)
     except Exception:
