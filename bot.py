@@ -12,11 +12,14 @@
   (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p) و اگر باز هم فایل بالای ۵۰ مگ بود،
   با ffmpeg آن را به قسمت‌های زیر ۴۸ مگ تقسیم می‌کند و قسمت‌ها را
   به ترتیب می‌فرستد.
-- راه دوم برای فایل بزرگ (اختیاری): MTProto با Telethon. اگر متغیرهای
-  TELETHON_API_ID و TELETHON_API_HASH و TELETHON_SESSION_STRING
-  ست شده باشند، فایل بزرگ (تا ۲ گیگابایت) مستقیم با حساب کاربری
-  تلگرام فرستاده می‌شود و نیازی به تیکه‌تیکه کردن نیست. اگر این
-  متغیرها نباشند، همان مسیر پایین آوردن کیفیت + تقسیم استفاده می‌شود.
+- راه دوم برای فایل بزرگ (اختیاری): MTProto با Telethon. اگر
+  TELETHON_API_ID و TELETHON_API_HASH ست باشند و سشن هم از یکی از
+  این سه جا بیاید — متغیر TELETHON_SESSION_STRING، فایل
+  /data/telethon_session.txt (روی Volume ریل‌وی) یا ساخته‌شده با
+  دستور /makesession توی پی‌وی — فایل بزرگ (تا ۲ گیگابایت) مستقیم
+  با حساب کاربری تلگرام فرستاده می‌شود و نیازی به تیکه‌تیکه کردن
+  نیست. اگر سشن نباشد، همان مسیر پایین آوردن کیفیت + تقسیم استفاده
+  می‌شود.
 - توکن از متغیر محیطی BOT_TOKEN خوانده می‌شود؛ هیچ‌وقت اینجا هاردکد نکن.
 - روش اجرا: polling — نیازی به دامین و وب‌هوک نیست.
 """
@@ -45,11 +48,16 @@ from telegram.ext import (
 # محیطی‌اش ست شده باشند، مسیر MTProto فعال می‌شود.
 try:
     from telethon import TelegramClient
+    from telethon.errors import SessionPasswordNeededError
     from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
 except ImportError:  # pragma: no cover - telethon not installed
     TelegramClient = None  # type: ignore[assignment]
     StringSession = None  # type: ignore[assignment]
+
+    class SessionPasswordNeededError(Exception):  # type: ignore[no-redef]
+        """جایگزین ساختگی؛ فقط وقتی Telethon نصب نیست استفاده می‌شود."""
+
     TELETHON_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -70,20 +78,68 @@ MAX_BYTES = 48 * 1024 * 1024
 TELETHON_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
+# سشن Telethon از سه جا می‌تواند بیاید (به ترتیب اولویت):
+# ۱) حافظه — ساخته‌شده با /makesession، بدون نیاز به ری‌استارت
+# ۲) متغیر محیطی TELETHON_SESSION_STRING
+# ۳) فایل /data/telethon_session.txt روی Volume ریل‌وی (بعد از ری‌استارت هم می‌ماند)
+# مسیر فایل با TELETHON_SESSION_FILE قابل تغییر است (پیش‌فرض /data/telethon_session.txt).
+TELETHON_SESSION_FILE = Path(
+    os.environ.get("TELETHON_SESSION_FILE", "/data/telethon_session.txt")
+)
+_RUNTIME_SESSION_STRING: str | None = None
+
+
+def get_telethon_session_string() -> str:
+    """رشته سشن Telethon؛ خالی اگر هیچ‌جا نباشد."""
+    if _RUNTIME_SESSION_STRING:
+        return _RUNTIME_SESSION_STRING
+    env_session = os.environ.get("TELETHON_SESSION_STRING", "").strip()
+    if env_session:
+        return env_session
+    try:
+        if TELETHON_SESSION_FILE.is_file():
+            return TELETHON_SESSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _telethon_api_credentials() -> tuple[int, str] | None:
+    """(api_id, api_hash) از متغیرهای محیطی؛ اگر نباشند None."""
+    if not TELETHON_AVAILABLE:
+        return None
+    try:
+        api_id = int(os.environ.get("TELETHON_API_ID", "").strip())
+    except ValueError:
+        return None
+    api_hash = os.environ.get("TELETHON_API_HASH", "").strip()
+    if not api_hash:
+        return None
+    return api_id, api_hash
+
+
+def _save_telethon_session(session_str: str) -> bool:
+    """سشن را توی حافظه و فایل ذخیره می‌کند.
+    True اگر فایل هم ذخیره شد، False اگر فقط حافظه شد."""
+    global _RUNTIME_SESSION_STRING
+    _RUNTIME_SESSION_STRING = session_str
+    try:
+        TELETHON_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TELETHON_SESSION_FILE.write_text(session_str, encoding="utf-8")
+        return True
+    except OSError:
+        logger.exception("Could not save Telethon session file")
+        return False
+
+
 def telethon_configured() -> bool:
-    """True اگر هر سه متغیر Telethon ست شده باشند و کتابخانه نصب باشد."""
+    """True اگر API ID/Hash ست باشند و سشن از حافظه، متغیر محیطی
+    یا فایل /data/telethon_session.txt بیاید و کتابخانه نصب باشد."""
     if not TELETHON_AVAILABLE:
         return False
-    api_id = os.environ.get("TELETHON_API_ID", "").strip()
-    api_hash = os.environ.get("TELETHON_API_HASH", "").strip()
-    session = os.environ.get("TELETHON_SESSION_STRING", "").strip()
-    if not api_id or not api_hash or not session:
+    if _telethon_api_credentials() is None:
         return False
-    try:
-        int(api_id)
-    except ValueError:
-        return False
-    return True
+    return bool(get_telethon_session_string())
 
 
 async def send_via_telethon(chat_id: int, path: Path, caption: str | None) -> bool:
@@ -97,12 +153,11 @@ async def send_via_telethon(chat_id: int, path: Path, caption: str | None) -> bo
     """
     if not telethon_configured():
         return False
-    try:
-        api_id = int(os.environ["TELETHON_API_ID"].strip())
-        api_hash = os.environ["TELETHON_API_HASH"].strip()
-        session_str = os.environ["TELETHON_SESSION_STRING"].strip()
-    except (KeyError, ValueError):
+    creds = _telethon_api_credentials()
+    session_str = get_telethon_session_string()
+    if creds is None or not session_str:
         return False
+    api_id, api_hash = creds
 
     client = None
     try:
@@ -153,10 +208,12 @@ START_TEXT = """سلام! 👋
 • یوتیوب توی این نسخه نیست.
 • تلگرام سقف سخت ۵۰ مگابایت برای ارسال فایل با ربات داره و با «مستقیم فرستادن» دور زده نمی‌شه. من اول کیفیت رو پایین می‌آرم (۷۲۰p، بعد ۴۸۰p، بعد ۳۶۰p). اگه فایل باز هم بزرگ بود، اگه ارسال با MTProto (Telethon) فعال باشه، مستقیم تا ۲ گیگابایت فرستاده می‌شه؛ اگه فعال نباشه، تیکه‌تیکه‌ش می‌کنم و قسمت‌ها رو به ترتیب می‌فرستم. پس ویدیوهای خیلی طولانی ممکنه چند قسمت بشن.
 • توی گروه هم کار می‌کنم، فقط باید Privacy Mode ربات خاموش باشه (تو BotFather با /setprivacy).
+• برای فعال کردن ارسال فایل بزرگ (MTProto)، توی پی‌وی /makesession رو بزن و شماره و کد رو بده؛ نیازی به ترمینال نیست.
 
 دستورها:
 /start — همین راهنما
 /help — همین راهنما
+/makesession — ساخت سشن Telethon با چت (فقط پی‌وی)؛ برای فعال کردن ارسال فایل بزرگ با MTProto
 """
 
 TOO_BIG_TEXT = (
@@ -524,10 +581,251 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(help_text())
 
 
+# ---------------------------------------------------------------------------
+# ساخت سشن Telethon با چت (/makesession) — فقط پی‌وی، بدون ترمینال
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(raw: str) -> str | None:
+    """شماره را به فرمت +کدکشور درمی‌آورد؛ اگر نشد None."""
+    phone = re.sub(r"[\s\-()]", "", raw.strip())
+    if phone.startswith("00"):
+        phone = "+" + phone[2:]
+    if phone.startswith("0"):
+        # با ۰ شروع شده (مثل ۰۹۱۲...)؛ کد کشور ندارد.
+        return None
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    if not re.fullmatch(r"\+\d{8,15}", phone):
+        return None
+    return phone
+
+
+async def _abort_makesession(update, context, text: str) -> None:
+    """کلاینت Telethon را قطع و وضعیت /makesession را پاک می‌کند."""
+    state = context.user_data.pop("makesession", None)
+    client = (state or {}).get("client")
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    await update.message.reply_text(text)
+
+
+async def _finish_makesession(update, context) -> None:
+    """سشن را از کلاینت ذخیره می‌کند (حافظه + فایل) و وضعیت را پاک می‌کند.
+    رشته سشن هیچ‌وقت توی چت فرستاده نمی‌شود."""
+    state = context.user_data.pop("makesession", {})
+    client = state.get("client")
+    if client is None:
+        await update.message.reply_text(
+            "چیزی برای ذخیره نیست؛ دوباره /makesession را بزن."
+        )
+        return
+    session_str = None
+    try:
+        session_str = client.session.save()
+    except Exception:
+        logger.exception("Could not save Telethon session string")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    if not session_str:
+        await update.message.reply_text(
+            "ذخیره سشن نشد؛ دوباره /makesession را بزن. 😕"
+        )
+        return
+    saved_to_file = _save_telethon_session(session_str)
+    text = (
+        "سشن ذخیره شد، MTProto فعال شد. ✅\n"
+        "حالا فایل‌های بزرگ تا ۲ گیگابایت مستقیم فرستاده می‌شوند."
+    )
+    if not saved_to_file:
+        text += (
+            "\n(نکته: ذخیره فایل سشن نشد؛ بعد از ری‌استارت ربات "
+            "باید دوباره بسازی.)"
+        )
+    await update.message.reply_text(text)
+
+
+async def makesession_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """شروع ساخت سشن Telethon — فقط پی‌وی."""
+    msg = update.message
+    if msg is None:
+        return
+    if msg.chat.type != "private":
+        await msg.reply_text(
+            "ساخت سشن فقط توی پی‌وی کار می‌کند؛ توی گروه نمی‌شود. 🙂"
+        )
+        return
+    if not TELETHON_AVAILABLE:
+        await msg.reply_text(
+            "Telethon روی سرور نصب نیست؛ فعلاً نمی‌شود سشن ساخت. 😕"
+        )
+        return
+    if _telethon_api_credentials() is None:
+        await msg.reply_text(
+            "اول باید TELETHON_API_ID و TELETHON_API_HASH توی "
+            "Variables ریل‌وی ست شده باشند."
+        )
+        return
+    if telethon_configured():
+        context.user_data["makesession"] = {"step": "await_overwrite_confirm"}
+        await msg.reply_text(
+            "سشن از قبل ساخته شده و MTProto فعال است. ✅\n"
+            "می‌خواهی دوباره بسازی و جایگزینش کنی؟\n"
+            "برای تایید «بله» را بفرست، برای لغو «خیر» را بفرست."
+        )
+        return
+    context.user_data["makesession"] = {"step": "await_phone"}
+    await msg.reply_text(
+        "شماره تلگرامت را با کد کشور بفرست؛ مثلاً +98...\n"
+        "تلگرام یک کد ورود برایت می‌فرستد.\n"
+        "برای لغو، «لغو» را بفرست."
+    )
+
+
+async def handle_makesession_step(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """یک پیام متنی را در جریان /makesession پردازش می‌کند.
+    True اگر پیام مصرف شد (و نباید به‌عنوان لینک پردازش شود)."""
+    msg = update.message
+    state = context.user_data.get("makesession")
+    if not state or msg is None or not msg.text:
+        return False
+    text = msg.text.strip()
+    step = state.get("step")
+
+    if text in ("لغو", "انصراف"):
+        await _abort_makesession(update, context, "لغو شد. 🙂")
+        return True
+
+    if step == "await_overwrite_confirm":
+        if text in ("بله", "آره", "yes", "Yes"):
+            context.user_data["makesession"] = {"step": "await_phone"}
+            await msg.reply_text(
+                "باشه. شماره تلگرامت را با کد کشور بفرست؛ مثلاً +98...\n"
+                "برای لغو، «لغو» را بفرست."
+            )
+        else:
+            await _abort_makesession(
+                update, context,
+                "لغو شد؛ سشن قبلی سر جایش ماند. 🙂",
+            )
+        return True
+
+    if step == "await_phone":
+        phone = _normalize_phone(text)
+        if phone is None:
+            await msg.reply_text(
+                "شماره درست نیست. با کد کشور بفرست؛ مثلاً +98...\n"
+                "برای لغو، «لغو» را بفرست."
+            )
+            return True
+        creds = _telethon_api_credentials()
+        if creds is None:
+            await _abort_makesession(
+                update, context,
+                "TELETHON_API_ID و TELETHON_API_HASH ست نیستند؛ "
+                "اول توی Variables ریل‌وی بذارشان.",
+            )
+            return True
+        api_id, api_hash = creds
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+        except Exception:
+            logger.exception("Telethon send_code_request failed")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            context.user_data.pop("makesession", None)
+            await msg.reply_text(
+                "نتونستم کد بفرستم؛ شماره را چک کن و دوباره /makesession را بزن. 😕"
+            )
+            return True
+        state["step"] = "await_code"
+        state["phone"] = phone
+        state["client"] = client
+        state["phone_code_hash"] = sent.phone_code_hash
+        await msg.reply_text(
+            "کد ورود ۵ رقمی که تلگرام فرستاد را بفرست.\n"
+            "برای لغو، «لغو» را بفرست."
+        )
+        return True
+
+    if step == "await_code":
+        code = re.sub(r"[\s\-]", "", text)
+        if not re.fullmatch(r"\d{5}", code):
+            await msg.reply_text(
+                "کد باید ۵ رقم باشد؛ دوباره بفرست.\n"
+                "برای لغو، «لغو» را بفرست."
+            )
+            return True
+        client = state.get("client")
+        if client is None:
+            await _abort_makesession(
+                update, context,
+                "ارتباط قطع شد؛ دوباره /makesession را بزن.",
+            )
+            return True
+        try:
+            await client.sign_in(
+                state.get("phone"), code,
+                phone_code_hash=state.get("phone_code_hash"),
+            )
+        except SessionPasswordNeededError:
+            state["step"] = "await_2fa"
+            await msg.reply_text("رمز دومرحله‌ای حسابت را بفرست.")
+            return True
+        except Exception:
+            logger.exception("Telethon sign_in failed")
+            await _abort_makesession(
+                update, context,
+                "کد اشتباه بود یا منقضی شد؛ دوباره /makesession را بزن. 😕",
+            )
+            return True
+        await _finish_makesession(update, context)
+        return True
+
+    if step == "await_2fa":
+        client = state.get("client")
+        if client is None:
+            await _abort_makesession(
+                update, context,
+                "ارتباط قطع شد؛ دوباره /makesession را بزن.",
+            )
+            return True
+        try:
+            await client.sign_in(password=msg.text)
+        except Exception:
+            logger.exception("Telethon 2FA sign_in failed")
+            await _abort_makesession(
+                update, context,
+                "رمز دومرحله‌ای اشتباه بود؛ دوباره /makesession را بزن. 😕",
+            )
+            return True
+        await _finish_makesession(update, context)
+        return True
+
+    # وضعیت ناشناخته؛ پاکش کن تا گیر نکند.
+    context.user_data.pop("makesession", None)
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """هر پیام متنی: اگر لینک اینستا/پورن‌هاب داشت، پردازش کن؛ اگر نه، رد شو."""
     msg = update.message
     if msg is None or not msg.text:
+        return
+
+    # اگر کاربر وسط ساخت سشن با /makesession است، پیامش را آن‌جا مصرف کن.
+    if await handle_makesession_step(update, context):
         return
 
     url = find_url(msg.text)
@@ -577,6 +875,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("makesession", makesession_cmd))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
