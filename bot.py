@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-دانلودر تلگرام — اینستاگرام + تیک‌تاک + یوتیوب + پورن‌هاب + ساندکلود.
+دانلودر تلگرام — اینستاگرام + تیک‌تاک + یوتیوب + پورن‌هاب + ساندکلود + پینترست.
 - پی‌وی و گروه.
-- اینستا و تیک‌تاک: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
+- اینستا، تیک‌تاک و پینترست: دانلود مستقیم؛ کپشن فقط «@<یوزرنیم ربات> ❤️».
+- پینترست: پین عکسی با کیفیت اصلی (originals)؛ پین چندعکسی همه عکس‌ها
+  را در یک آلبوم می‌فرستد؛ پین ویدیویی مثل تیک‌تاک با yt-dlp دانلود
+  می‌شود. لینک pin.it هم باز می‌شود؛ لینک بورد/پروفایل پین تکی نیست.
 - یوتیوب و پورن‌هاب: اول منوی انتخاب کیفیت، بعد دانلود با عکس کاور و
   پیشرفت هر ۵ ثانیه؛ ویدیو با کاور (thumbnail) فرستاده می‌شود.
   یوتیوب یک گزینه «صوتی (mp3)» هم دارد.
@@ -45,12 +48,12 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 import uuid
 from pathlib import Path
 
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -546,7 +549,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
 
 START_TEXT = """سلام! 👋
 لینک بفرست تا دانلودش کنم:
-📸 اینستاگرام و تیک‌تاک
+📸 اینستاگرام، تیک‌تاک و پینترست
 🎬 یوتیوب و پورن‌هاب — کیفیت رو انتخاب می‌کنی
 🎵 ساندکلود
 /makesession — فقط پی‌وی"""
@@ -619,6 +622,8 @@ def detect_platform(url: str) -> str | None:
         return "youtube"
     if "soundcloud.com" in low:
         return "soundcloud"
+    if "pinterest." in low or "pin.it" in low:
+        return "pinterest"
     return None
 
 
@@ -627,6 +632,7 @@ _PLATFORM_REFERERS = {
     "pornhub": "https://www.pornhub.com/",
     "instagram": "https://www.instagram.com/",
     "tiktok": "https://www.tiktok.com/",
+    "pinterest": "https://www.pinterest.com/",
     "youtube": "https://www.youtube.com/",
     "soundcloud": "https://soundcloud.com/",
 }
@@ -1748,6 +1754,457 @@ async def do_tiktok_download(bot, chat_id: int, url: str) -> str:
             pass
 
 
+# ---------------------------------------------------------------------------
+# پینترست (بدون لاگین، با API خود پینترست)
+# ---------------------------------------------------------------------------
+# چرا yt-dlp به‌تنهایی کافی نیست: اکسترکتور پینترست yt-dlp فقط ویدیو
+# را می‌فهمد — برای پین عکسی با «No video formats found!» می‌میرد و
+# پین چندعکسی (چند صفحه) را اصلاً نمی‌بیند. پس اطلاعات پین مستقیم از
+# همان API بدون لاگین پینترست گرفته می‌شود که اکسترکتور yt-dlp هم
+# استفاده می‌کند (PinResource/get با field_set_key
+# unauth_react_main_pin):
+# - پین ویدیویی: videos.video_list فرمت‌های mp4 را می‌دهد؛ دانلودش
+#   مثل تیک‌تاک با yt-dlp انجام می‌شود.
+# - پین عکسی: images.orig کیفیت اصلی است (گاهی ‎.heic است)؛ پین
+#   چندعکسی صفحه‌های story_pin_data است و هر صفحه یک عکس دارد
+#   (image.images.originals). همه عکس‌ها به ترتیب صفحه جمع می‌شوند
+#   و به‌صورت یک آلبوم فرستاده می‌شوند.
+# تست زنده (از همین VM، بدون لاگین): API جواب می‌دهد؛ ویدیوی
+# Origami واقعاً دانلود شد (۵٫۲ مگ mp4)؛ عکس اصلی jpg و heic هر دو
+# 200 دادند؛ heic با ffmpeg به jpg تبدیل شد؛ pin.it با 308 ریدایرکت
+# می‌شود. یک نکته واقعی: آدرس originals با پسوند ‎.jpg گاهی 403
+# می‌دهد (وقتی اصل فایل heic است) — پس هر عکس چند آدرس جایگزین
+# دارد (اصل، همان هش با ‎.jpg، و نسخه 736x).
+
+PINTEREST_API_URL = "https://www.pinterest.com/resource/PinResource/get/"
+
+# سقف عکس در Bot API برای send_photo / media group: ۱۰ مگ.
+PINTEREST_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+
+# سقف عکس‌های یک پین (پین چندصفحه‌ای حداکثر ۲۰ صفحه دارد).
+PINTEREST_MAX_IMAGES = 20
+
+_PIN_ID_RE = re.compile(r"/pin/(?:[\w-]+--)?(\d+)", re.IGNORECASE)
+
+
+def _extract_pinterest_pin_id(url: str) -> str | None:
+    """آیدی عددی پین از URL (شامل فرم اسلاگ‌دار
+    /pin/<slug>--<id>). None اگر URL پین تکی نباشد (بورد/پروفایل)."""
+    m = _PIN_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _resolve_pinterest_url_sync(url: str) -> str | None:
+    """لینک کوتاه pin.it را باز می‌کند و URL نهایی را برمی‌گرداند؛
+    برای لینک معمولی همان URL. None اگر باز نشد."""
+    if "pin.it" not in url.lower():
+        return url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": CHROME_USER_AGENT,
+                "Referer": "https://www.pinterest.com/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            try:
+                resp.read(1)
+            except Exception:
+                pass
+            return resp.geturl()
+    except Exception:
+        logger.warning("pin.it resolve failed for %s", url)
+        return None
+
+
+def _fetch_pinterest_pin_sync(pin_id: str) -> dict | None:
+    """اطلاعات پین از API بدون لاگین پینترست (PinResource).
+    None اگر نشد — پین حذف‌شده/خصوصی 404 می‌دهد."""
+    try:
+        payload = {
+            "options": {
+                "field_set_key": "unauth_react_main_pin",
+                "id": pin_id,
+            }
+        }
+        q = urlencode({"data": json.dumps(payload)})
+        req = urllib.request.Request(
+            PINTEREST_API_URL + "?" + q,
+            headers={
+                "User-Agent": CHROME_USER_AGENT,
+                "X-Pinterest-PWS-Handler": "www/[username].js",
+                "Referer": f"https://www.pinterest.com/pin/{pin_id}/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+        pin = (data.get("resource_response") or {}).get("data")
+        return pin if isinstance(pin, dict) else None
+    except Exception:
+        logger.warning("Pinterest API failed for pin %s", pin_id)
+        return None
+
+
+def _pinterest_has_video(data: dict) -> bool:
+    """True اگر پین ویدیو داشته باشد (video_list پر باشد).
+    is_video قابل اعتماد نیست — برای پین ویدیویی هم False می‌آید."""
+    videos = data.get("videos")
+    if not isinstance(videos, dict):
+        return False
+    return bool(videos.get("video_list"))
+
+
+def _pinterest_image_signature(url: str) -> str:
+    """کلید یکتا برای تشخیص عکس تکراری: نام فایل بدون پسوند.
+    یک عکس ممکن است دو آدرس داشته باشد (‎.jpg توی صفحه‌ها و ‎.heic
+    توی images اصلی) — هش فایل یکی است."""
+    try:
+        name = urlparse(url).path.rsplit("/", 1)[-1]
+        return name.rsplit(".", 1)[0].lower()
+    except Exception:
+        return (url or "").lower()
+
+
+def _largest_image_url(images: dict | None) -> str | None:
+    """بزرگ‌ترین ورودی یک دیکشنری images (بر اساس مساحت)."""
+    best: str | None = None
+    best_area = -1
+    for entry in (images or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        u = entry.get("url")
+        if not u:
+            continue
+        area = (entry.get("width") or 0) * (entry.get("height") or 0)
+        if area >= best_area:
+            best_area = area
+            best = u
+    return best
+
+
+def _pinterest_pick_images(data: dict) -> list[list[str]]:
+    """عکس‌های پین با کیفیت اصلی؛ هر عکس یک فهرست آدرس جایگزین
+    دارد (بهترین اول). ترتیب: اول صفحه‌های story (پین چندعکسی)،
+    بعد عکس اصلی پین. عکس تکراری (یک هش، دو پسوند) فقط یک بار
+    می‌آید — آدرس دومش جایگزین همان عکس می‌شود."""
+    images: list[list[str]] = []
+    by_sig: dict[str, list[str]] = {}
+
+    def _add(u: str | None) -> None:
+        if not u:
+            return
+        sig = _pinterest_image_signature(u)
+        if sig in by_sig:
+            if u not in by_sig[sig]:
+                by_sig[sig].append(u)
+        else:
+            by_sig[sig] = [u]
+            images.append(by_sig[sig])
+
+    story = data.get("story_pin_data")
+    if isinstance(story, dict):
+        for page in story.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            for block in page.get("blocks") or []:
+                if not isinstance(block, dict):
+                    continue
+                img = block.get("image")
+                if not isinstance(img, dict):
+                    continue
+                imgs = img.get("images")
+                if not isinstance(imgs, dict) or not imgs:
+                    continue
+                orig = imgs.get("originals")
+                u = orig.get("url") if isinstance(orig, dict) else None
+                _add(u or _largest_image_url(imgs))
+
+    main = data.get("images")
+    if isinstance(main, dict) and main:
+        orig = main.get("orig")
+        u = orig.get("url") if isinstance(orig, dict) else None
+        _add(u or _largest_image_url(main))
+
+    return images[:PINTEREST_MAX_IMAGES]
+
+
+def _pinterest_736x_variant(url: str) -> str | None:
+    """نسخه 736x همان عکس (i.pinimg.com همیشه این نسخه را دارد).
+    None اگر آدرس از اول 736x باشد یا شکلش عادی نباشد."""
+    try:
+        parts = urlparse(url).path.split("/")
+        # /<size>/<h1>/<h2>/<h3>/<file>
+        if len(parts) < 3 or parts[1] == "736x":
+            return None
+        stem = parts[-1].rsplit(".", 1)[0]
+        return "https://i.pinimg.com/736x/" + "/".join(
+            parts[2:-1] + [stem + ".jpg"]
+        )
+    except Exception:
+        return None
+
+
+def _pinterest_download_image_sync(candidates: list[str], outdir: str,
+                                   index: int) -> Path | None:
+    """یک عکس پین را دانلود می‌کند. اول آدرس‌های اصلی (به ترتیب)،
+    بعد برای heic نسخه ‎.jpg همان هش، و در آخر نسخه 736x — چون
+    آدرس originals با ‎.jpg گاهی 403 می‌دهد (وقتی اصل فایل heic
+    است). اصل heic با ffmpeg به jpg تبدیل می‌شود تا تلگرام آن را
+    عکس نشان بدهد؛ اگر تبدیل نشد، خود ‎.heic نگه داشته می‌شود
+    (به‌عنوان فایل فرستاده می‌شود). None اگر هیچ آدرسی نشد."""
+    attempts: list[str] = []
+    for u in candidates:
+        if u and u not in attempts:
+            attempts.append(u)
+        if u and u.lower().endswith((".heic", ".heif")):
+            jpg = u.rsplit(".", 1)[0] + ".jpg"
+            if jpg not in attempts:
+                attempts.append(jpg)
+    for u in candidates:
+        alt = _pinterest_736x_variant(u)
+        if alt and alt not in attempts:
+            attempts.append(alt)
+
+    for attempt_url in attempts:
+        try:
+            req = urllib.request.Request(
+                attempt_url,
+                headers={
+                    "User-Agent": CHROME_USER_AGENT,
+                    "Referer": "https://www.pinterest.com/",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if resp.status != 200:
+                    continue
+                blob = resp.read()
+            if not blob:
+                continue
+            tail = attempt_url.rsplit("/", 1)[-1]
+            ext = tail.rsplit(".", 1)[-1].lower() if "." in tail else "jpg"
+            if ext not in ("jpg", "jpeg", "png", "webp", "heic", "heif", "gif"):
+                ext = "jpg"
+            path = Path(outdir) / f"pin_{index:02d}.{ext}"
+            path.write_bytes(blob)
+            if ext in ("heic", "heif"):
+                jpg = Path(outdir) / f"pin_{index:02d}.jpg"
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error", "-i", str(path), str(jpg)],
+                    capture_output=True, timeout=120,
+                )
+                if r.returncode == 0 and jpg.is_file() and jpg.stat().st_size > 0:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    return jpg
+                logger.warning(
+                    "HEIC convert failed for %s; keeping .heic", attempt_url
+                )
+            return path
+        except Exception:
+            logger.warning(
+                "Pinterest image download failed: %s", attempt_url
+            )
+            continue
+    return None
+
+
+async def _send_pinterest_photos(bot, chat_id: int, files: list[Path],
+                                 caption: str | None,
+                                 tracker: ProgressTracker | None = None) -> bool:
+    """عکس‌های پین را می‌فرستد. دو عکس یا بیشتر (هر کدام زیر ۱۰ مگ)
+    به‌صورت یک آلبوم (media group، کپشن روی عکس اول) می‌روند —
+    کاربر همه را یک‌جا می‌بیند، نه تک‌تک. تک‌عکس، عکس‌های بالای
+    ۱۰ مگ و بقیه فایل‌ها (‎.heic تبدیل‌نشده، گیف) با send_files
+    معمولی فرستاده می‌شوند؛ اگر آلبوم خطا داد، همان دسته تک‌تک
+    فرستاده می‌شود. True اگر چیزی فرستاده شد."""
+    photos = [
+        p for p in files
+        if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+    ]
+    groupable = [
+        p for p in photos
+        if p.stat().st_size <= PINTEREST_PHOTO_MAX_BYTES
+    ]
+    rest = [p for p in files if p not in groupable]
+    sent_any = False
+
+    if len(groupable) >= 2:
+        if tracker is not None:
+            tracker.begin_upload(
+                len(groupable),
+                sum(p.stat().st_size for p in groupable),
+            )
+        for start in range(0, len(groupable), 10):
+            chunk = groupable[start:start + 10]
+            if len(chunk) < 2:
+                # آلبوم تلگرام حداقل ۲ عکس می‌خواهد؛ تک‌عکس باقی‌مانده
+                # (مثلاً عکس یازدهم) تک‌تک فرستاده می‌شود.
+                caps = [caption if (start == 0) else None]
+                if await send_files(
+                    bot, chat_id, chunk, caps, tracker=tracker
+                ):
+                    sent_any = True
+                continue
+            try:
+                media = []
+                handles = []
+                for i, p in enumerate(chunk):
+                    f = open(p, "rb")
+                    handles.append(f)
+                    media.append(
+                        InputMediaPhoto(
+                            media=f,
+                            caption=caption
+                            if (start == 0 and i == 0) else None,
+                        )
+                    )
+                try:
+                    await bot.send_media_group(chat_id=chat_id, media=media)
+                finally:
+                    for f in handles:
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+                sent_any = True
+                if tracker is not None:
+                    for p in chunk:
+                        tracker.mark_upload_part_done(p.stat().st_size)
+            except Exception:
+                logger.exception(
+                    "Pinterest media group failed; sending photos one by one"
+                )
+                caps = [
+                    caption if (start == 0 and i == 0) else None
+                    for i in range(len(chunk))
+                ]
+                if await send_files(
+                    bot, chat_id, chunk, caps, tracker=tracker
+                ):
+                    sent_any = True
+    else:
+        rest = groupable + rest
+
+    if rest:
+        caps = [caption if not sent_any else None] + [None] * (len(rest) - 1)
+        if await send_files(bot, chat_id, rest, caps, tracker=tracker):
+            sent_any = True
+    return sent_any
+
+
+async def do_pinterest_download(bot, chat_id: int, url: str) -> str:
+    """دانلود پینترست — مثل اینستاگرام و تیک‌تاک: دانلود مستقیم،
+    بدون منوی کیفیت، کپشن فقط «@ربات ❤️».
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    اول لینک pin.it باز می‌شود و آیدی پین از URL درمی‌آید؛ لینک
+    بورد/پروفایل پین تکی نیست و 'empty' برمی‌گرداند.
+    پین ویدیویی: مثل تیک‌تاک با yt-dlp دانلود می‌شود.
+    پین عکسی: همه عکس‌های پین با کیفیت اصلی (originals) از
+    API خود پینترست گرفته می‌شوند — پین چندعکسی همه عکس‌ها را
+    می‌فرستد، نه فقط اولی؛ عکس‌ها به‌صورت یک آلبوم (media group)
+    فرستاده می‌شوند."""
+    tracker = ProgressTracker()
+    done = asyncio.Event()
+    status = await bot.send_message(
+        chat_id=chat_id, text=_progress_text(0, "info"),
+    )
+    watcher = asyncio.create_task(
+        _watch_progress(
+            bot, chat_id, status.message_id, tracker, done, False,
+        )
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="pin-") as tmpdir:
+            # ۰) pin.it را باز کن و آیدی پین را بگیر
+            resolved = await asyncio.to_thread(
+                _resolve_pinterest_url_sync, url
+            )
+            pin_id = _extract_pinterest_pin_id(resolved or url)
+            if not pin_id:
+                return "empty"
+            # ۱) اطلاعات پین از API پینترست
+            data = await asyncio.to_thread(
+                _fetch_pinterest_pin_sync, pin_id
+            )
+            if not data:
+                return "empty"
+            # ۲) پین ویدیویی: مثل تیک‌تاک (اول لینک مستقیم،
+            # بعد دانلود با yt-dlp، بعد ارسال).
+            if _pinterest_has_video(data):
+                info = await asyncio.to_thread(
+                    _fetch_info_sync, resolved or url
+                )
+                if info:
+                    caption = await instagram_caption(bot)
+                    if await _try_direct_url_send(
+                        bot, chat_id, info, 720, caption, None, tracker
+                    ):
+                        return "ok"
+                try:
+                    title, files, was_split = await download_best_effort(
+                        resolved or url, tmpdir,
+                        prefer_telethon=bot_telethon_available() or telethon_send_enabled(),
+                        tracker=tracker,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pinterest video download failed for %s", url
+                    )
+                    return "error"
+                if not files:
+                    return "empty"
+                sent = await _deliver(
+                    bot, chat_id, tmpdir, title, files, was_split,
+                    "instagram", tracker=tracker,
+                )
+                if sent:
+                    return "ok"
+                if all(p.stat().st_size > MAX_BYTES for p in files):
+                    return "too_big"
+                return "empty"
+            # ۳) پین عکسی: همه عکس‌ها با کیفیت اصلی
+            candidates = _pinterest_pick_images(data)
+            if not candidates:
+                return "empty"
+            tracker.set_phase("download")
+            tracker.total = len(candidates)
+            files: list[Path] = []
+            for i, cands in enumerate(candidates):
+                try:
+                    path = await asyncio.to_thread(
+                        _pinterest_download_image_sync, cands, tmpdir, i
+                    )
+                except Exception:
+                    logger.exception(
+                        "Pinterest image download failed for %s", url
+                    )
+                    path = None
+                if path is not None:
+                    files.append(path)
+                tracker.downloaded = len(files)
+            if not files:
+                return "empty"
+            caption = await instagram_caption(bot)
+            sent = await _send_pinterest_photos(
+                bot, chat_id, files, caption, tracker=tracker
+            )
+            if sent:
+                return "ok"
+            if all(p.stat().st_size > MAX_BYTES for p in files):
+                return "too_big"
+            return "empty"
+    finally:
+        done.set()
+        watcher.cancel()
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
 async def _watch_progress(bot, chat_id: int, message_id: int,
                           tracker: ProgressTracker,
                           done: asyncio.Event,
@@ -2846,6 +3303,8 @@ async def _background_download(bot, chat_id: int, url: str,
             )
         elif platform == "tiktok":
             result = await do_tiktok_download(bot, chat_id, url)
+        elif platform == "pinterest":
+            result = await do_pinterest_download(bot, chat_id, url)
         elif platform == "soundcloud":
             result = await do_soundcloud_download(bot, chat_id, url)
         else:
@@ -3248,7 +3707,7 @@ async def handle_makesession_step(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هر پیام متنی: لینک اینستا/تیک‌تاک/یوتیوب/پورن‌هاب/ساندکلود
+    """هر پیام متنی: لینک اینستا/تیک‌تاک/یوتیوب/پورن‌هاب/ساندکلود/پینترست
     را پردازش کن؛ اگر نه، رد شو.
     دانلود در پس‌زمینه اجرا می‌شود تا ربات به بقیه دستورها جواب بدهد."""
     msg = update.message
@@ -3268,7 +3727,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not platform:
         if msg.chat.type == "private":
             await msg.reply_text(
-                "فقط اینستاگرام، تیک‌تاک، یوتیوب، پورن‌هاب و ساندکلود."
+                "فقط اینستاگرام، تیک‌تاک، یوتیوب، پورن‌هاب، ساندکلود و پینترست."
             )
         return
 
@@ -3282,7 +3741,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _offer_youtube_quality(update, context, url)
         return
 
-    # اینستاگرام، تیک‌تاک و ساندکلود: دانلود مستقیم، در پس‌زمینه.
+    # اینستاگرام، تیک‌تاک، ساندکلود و پینترست: دانلود مستقیم، در پس‌زمینه.
     asyncio.create_task(
         _background_download(context.bot, msg.chat.id, url, platform)
     )
