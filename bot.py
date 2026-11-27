@@ -646,15 +646,6 @@ YOUTUBE_COOKIES_FILE = Path(
 # کلید فقط از متغیر محیطی می‌آید — هیچ‌جا هاردکد نمی‌شود.
 GFWDEV_API_BASE = "https://api.gfwdev.ir/youtube"
 GFWDEV_API_KEY = os.environ.get("GFWDEV_API_KEY", "").strip()
-# کلید موزیک GFw (جستجو/استریم) جدا از کلید یوتیوب است:
-# مستندات برای هر سرویس «کلید لایسنس فعال <سرویس>» می‌خواهد
-# و لایسنس از منوی «وب‌سرویس‌ها» در @GFwAPIBOT برای همان
-# سرویس ساخته می‌شود؛ کلید یوتیوب روی /music/search با 401
-# (بدنه خالی) رد شد، پس اگر GFWDEV_MUSIC_API_KEY ست نشده
-# باشد همان کلید یوتیوب استفاده می‌شود (رفتار قبلی).
-GFWDEV_MUSIC_API_KEY = (
-    os.environ.get("GFWDEV_MUSIC_API_KEY", "").strip() or GFWDEV_API_KEY
-)
 _IMPERSONATION_WARNING_LOGGED = False
 
 
@@ -3369,15 +3360,14 @@ async def do_soundcloud_download(bot, chat_id: int, url: str) -> str:
 # خواننده، بعد فایل صوتی mp3 با عنوان و خواننده درست.
 # ---------------------------------------------------------------------------
 # صدای اسپاتیفای DRM دارد و دانلود مستقیم از خود اسپاتیفای ممکن
-# نیست؛ پس متادیتا (اسم آهنگ، خواننده، کاور) از صفحه embed اسپاتیفای
-# (بدون لاگین، __NEXT_DATA__) گرفته می‌شود و صدا اول از جستجوی
-# موزیک GFw می‌آید؛ اگر آن نشد، یوتیوب با GFw (کیفیت صوتی) و در
-# آخر yt-dlp مستقیم. پری‌ویو ۳۰ ثانیه‌ای اسپاتیفای استفاده نمی‌شود
-# (آهنگ کامل نیست).
-SPOTIFY_EMBED_BASE = "https://open.spotify.com/embed"
+# نیست؛ پس مسیر اصلی حالا وب‌سرویس NestAPI است
+# (open.nestapi.ir/apis-1/spotify-download): بدون کلید، متادیتا
+# (اسم، خواننده، کاور، مدت) + لینک مستقیم mp3 را می‌دهد؛ اگر
+# NestAPI نشد یا لینک دانلود نداد، fallback جستجوی یوتیوب
+# (با کوکی لاگین‌شده، اگر باشد) + صدای GFw؛ در آخر yt-dlp
+# مستقیم. پری‌ویو ۳۰ ثانیه‌ای اسپاتیفای استفاده نمی‌شود.
+NESTAPI_SPOTIFY_URL = "https://open.nestapi.ir/apis-1/spotify-download"
 SPOTIFY_REFERER = "https://open.spotify.com/"
-GFWDEV_MUSIC_SEARCH_URL = "https://api.gfwdev.ir/music/search"
-GFWDEV_MUSIC_STREAM_URL = "https://api.gfwdev.ir/music/stream"
 
 
 def _extract_spotify_kind_and_id(url: str) -> tuple[str, str] | None:
@@ -3401,6 +3391,75 @@ def _extract_spotify_kind_and_id(url: str) -> tuple[str, str] | None:
     if not sid or len(sid) > 64:
         return None
     return kind, sid
+
+
+def _nestapi_spotify_sync(url: str) -> tuple[dict | None, str]:
+    """پاسخ NestAPI برای یک لینک اسپاتیفای (بدون کلید):
+    GET open.nestapi.ir/apis-1/spotify-download?url=<link>
+    برمی‌گرداند (data, کد خطا): data با tracks (هر کدام
+    name/artists/cover/duration_ms/download)؛ کد خطا "" اگر
+    موفق بود، وگرنه code از error پاسخ (مثلاً TRACK_NOT_FOUND)
+    یا "" اگر معلوم نبود. برای آلبوم/پلی‌لیست همه آهنگ‌ها با
+    لینک دانلودشان می‌آیند."""
+    try:
+        req = urllib.request.Request(
+            f"{NESTAPI_SPOTIFY_URL}?url={quote(url, safe='')}",
+            headers={"User-Agent": CHROME_USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        code = ""
+        try:
+            body = json.loads(e.read().decode("utf-8", "replace"))
+            code = str(((body or {}).get("error") or {}).get("code") or "")
+        except Exception:
+            pass
+        logger.warning(
+            "NestAPI Spotify HTTP %s (%s) for %s", e.code, code, url
+        )
+        return None, code
+    except Exception:
+        logger.warning("NestAPI Spotify fetch failed for %s", url)
+        return None, ""
+    if not isinstance(payload, dict) or not payload.get("success"):
+        err = (payload or {}).get("error") or {}
+        code = str(err.get("code") or "") if isinstance(err, dict) else ""
+        logger.warning(
+            "NestAPI Spotify error for %s: %s", url, code or err
+        )
+        return None, code
+    data = payload.get("data")
+    return (data if isinstance(data, dict) else None), ""
+
+
+def _nestapi_first_track(
+    data: dict,
+) -> tuple[str, str, str | None, int | None, str | None] | None:
+    """(title, artist, cover_url, duration_ms, download_url|None)
+    از اولین آهنگ پاسخ NestAPI؛ download_url ممکن است None
+    باشد (اگر آن آهنگ لینک دانلود نداشت) — در آن صورت
+    do_spotify_download به fallback یوتیوب می‌رود. None فقط
+    اگر هیچ آهنگی نبود. برای آلبوم/پلی‌لیست فعلاً فقط اولین
+    آهنگ گرفته می‌شود (مثل رفتار قبلی ربات)."""
+    for t in data.get("tracks") or []:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name") or "").strip()
+        if not name:
+            continue
+        artists = [
+            str(a).strip() for a in (t.get("artists") or [])
+            if str(a).strip()
+        ]
+        cover = str(
+            t.get("cover") or data.get("cover") or ""
+        ).strip() or None
+        dur = t.get("duration_ms")
+        duration_ms = int(dur) if isinstance(dur, int) else None
+        dl = str(t.get("download") or "").strip() or None
+        return name, ", ".join(artists), cover, duration_ms, dl
+    return None
 
 
 def _resolve_spotify_url_sync(url: str) -> str | None:
@@ -3427,237 +3486,12 @@ def _resolve_spotify_url_sync(url: str) -> str | None:
         return None
 
 
-def _fetch_spotify_embed_sync(kind: str, sid: str) -> dict | None:
-    """entity صفحه embed اسپاتیفای (بدون لاگین) را برمی‌گرداند؛
-    None اگر صفحه 404 بود یا ساختارش عوض شده بود."""
-    embed_url = f"{SPOTIFY_EMBED_BASE}/{kind}/{sid}"
-    try:
-        req = urllib.request.Request(
-            embed_url,
-            headers={"User-Agent": CHROME_USER_AGENT},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            html = resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        logger.warning("Spotify embed HTTP %s for %s/%s", e.code, kind, sid)
-        return None
-    except Exception:
-        logger.warning("Spotify embed fetch failed for %s/%s", kind, sid)
-        return None
-    m = re.search(
-        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S
-    )
-    if not m:
-        logger.warning(
-            "Spotify embed: no __NEXT_DATA__ for %s/%s", kind, sid
-        )
-        return None
-    try:
-        data = json.loads(m.group(1))
-        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
-    except Exception:
-        logger.warning(
-            "Spotify embed: unexpected JSON for %s/%s", kind, sid
-        )
-        return None
-    return entity if isinstance(entity, dict) else None
 
 
-def _spotify_pick_cover(images) -> str | None:
-    """بزرگ‌ترین کاور از visualIdentity.image (بر اساس maxWidth)."""
-    best = None
-    best_area = -1
-    for im in images or []:
-        if not isinstance(im, dict):
-            continue
-        u = im.get("url")
-        if not u:
-            continue
-        area = (im.get("maxWidth") or 0) * (im.get("maxHeight") or 0)
-        if area >= best_area:
-            best_area = area
-            best = u
-    return best
 
 
-def _spotify_parse_entity(
-    entity: dict,
-) -> tuple[str, str, str | None, int | None]:
-    """(title, artist, cover_url, duration_ms) از entity صفحه embed.
-    خواننده: همه artists با «, » جدا می‌شوند؛ اگر نبود، خالی
-    (هیچ‌وقت «Unknown» برنمی‌گردد)."""
-    title = str(entity.get("title") or entity.get("name") or "").strip()
-    artists: list[str] = []
-    for a in entity.get("artists") or []:
-        if isinstance(a, dict):
-            name = str(a.get("name") or "").strip()
-            if name:
-                artists.append(name)
-    artist = ", ".join(artists)
-    cover = _spotify_pick_cover(
-        (entity.get("visualIdentity") or {}).get("image")
-    )
-    duration = entity.get("duration")
-    duration_ms = int(duration) if isinstance(duration, int) else None
-    return title, artist, cover, duration_ms
 
 
-def _normalize_music_text(s: str) -> str:
-    """نرمال‌سازی برای مقایسه عنوان/خواننده: حروف کوچک، بدون
-    علائم نگارشی و فاصله‌های اضافه."""
-    s = (s or "").lower()
-    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _gfw_music_search_sync(
-    query: str, api_key: str, timeout: int = 60
-) -> tuple[list, str]:
-    """جستجوی موزیک با وب‌سرویس GFw (فقط stdlib).
-    برمی‌گرداند: (فهرست آهنگ‌ها یا []، کد خطا یا "").
-    کد خطا: "no_key" (کلید ست نشده) | "bad_key" (کلید نامعتبر)
-    | "error" | "unavailable".
-    شکل پاسخ توی مستندات GFw نمونه JSON ندارد، پس پارس دفاعی
-    است: data می‌تواند لیست باشد، یا دیکشنری با کلید results /
-    tracks / items / songs / list، یا یک آهنگ تکی؛ هر شکل
-    غیرمنتظره لاگ می‌شود تا اولین خطای واقعی قابل تشخیص باشد."""
-    if not api_key:
-        return [], "no_key"
-    api_url = (
-        f"{GFWDEV_MUSIC_SEARCH_URL}?q={quote(query, safe='')}"
-        f"&api_key={quote(api_key, safe='')}"
-    )
-    req = urllib.request.Request(
-        api_url, headers={"User-Agent": CHROME_USER_AGENT},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        msg = ""
-        try:
-            body = e.read().decode("utf-8", "replace")
-            try:
-                msg = str(json.loads(body).get("message") or "")
-            except Exception:
-                msg = body
-        except Exception:
-            pass
-        logger.warning("GFw music search HTTP %s: %s", e.code, msg[:200])
-        return [], _gfw_api_error_code(msg, e.code)
-    except Exception:
-        logger.exception("GFw music search request failed")
-        return [], "error"
-    if status != 200:
-        return [], "error"
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except Exception:
-        logger.warning("GFw music search returned invalid JSON")
-        return [], "error"
-    if not isinstance(payload, dict):
-        return [], "error"
-    if not payload.get("status"):
-        return [], _gfw_api_error_code(
-            str(payload.get("message") or ""), None
-        )
-    data = payload.get("data")
-    tracks: list = []
-    if isinstance(data, list):
-        tracks = data
-    elif isinstance(data, dict):
-        for key in ("results", "tracks", "items", "songs", "list"):
-            if isinstance(data.get(key), list):
-                tracks = data[key]
-                break
-        else:
-            # یک آهنگ تکی
-            if data.get("id") or data.get("track_id"):
-                tracks = [data]
-    if not isinstance(tracks, list):
-        tracks = []
-    tracks = [t for t in tracks if isinstance(t, dict)]
-    if not tracks and data is not None:
-        logger.warning(
-            "GFw music search: unexpected data shape keys=%s",
-            list(data.keys())
-            if isinstance(data, dict) else type(data).__name__,
-        )
-    return tracks, ""
-
-
-def _gfw_music_track_id(track: dict) -> str | None:
-    """آیدی آهنگ از نتیجه جستجوی موزیک GFw."""
-    for key in ("track_id", "id", "trackId"):
-        v = track.get(key)
-        if v:
-            return str(v)
-    return None
-
-
-def _gfw_music_track_stream_url(track: dict) -> str | None:
-    """لینک مستقیم استریم از نتیجه جستجو، اگر خودش داده باشد.
-    «url» فقط وقتی قبول می‌شود که لینک استریم GFw یا فایل صوتی
-    باشد — نه صفحه اسپاتیفای یا صفحه وب."""
-    for key in ("stream_url", "download_url", "stream"):
-        v = track.get(key)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
-    v = track.get("url")
-    if isinstance(v, str) and v.startswith("http"):
-        low = v.lower()
-        if "spotify.com" in low:
-            return None
-        if "/music/stream/" in low or low.split("?")[0].endswith(
-            (".mp3", ".ogg", ".m4a", ".aac", ".flac", ".wav", ".opus")
-        ):
-            return v
-    return None
-
-
-def _gfw_pick_music_track(
-    tracks: list, title: str, artist: str
-) -> dict | None:
-    """بهترین نتیجه جستجو: عنوان باید با آهنگ اسپاتیفای بخواند
-    (وگرنه None تا fallback امتحان شود)؛ تطابق خواننده امتیاز
-    می‌دهد ولی به‌تنهایی کافی نیست."""
-    want_title = _normalize_music_text(title)
-    want_artist = _normalize_music_text(artist)
-    best = None
-    best_score = -1
-    for t in tracks:
-        t_title = str(t.get("title") or t.get("name") or "")
-        t_artist = t.get("artist") or t.get("artists") or ""
-        if isinstance(t_artist, list):
-            t_artist = ", ".join(
-                str(
-                    a.get("name") if isinstance(a, dict) else a or ""
-                )
-                for a in t_artist
-            )
-        t_artist = str(t_artist)
-        n_title = _normalize_music_text(t_title)
-        n_artist = _normalize_music_text(t_artist)
-        score = 0
-        if want_title and n_title:
-            if (
-                n_title == want_title
-                or want_title in n_title
-                or n_title in want_title
-            ):
-                score += 2
-            elif set(want_title.split()) & set(n_title.split()):
-                score += 1
-        if want_artist and n_artist:
-            if want_artist in n_artist or n_artist in want_artist:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best = t
-    if best is None or best_score < 2:
-        return None
-    return best
 
 
 def _search_youtube_url_sync(query: str) -> str | None:
@@ -3760,10 +3594,12 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
     """دانلود اسپاتیفای — دقیقاً مثل ساندکلود: اول کاور آهنگ با
     اسم آهنگ و خواننده، بعد فایل صوتی mp3 با عنوان و خواننده درست.
     اگر لینک آلبوم/پلی‌لیست باشد، فقط اولین آهنگ گرفته می‌شود.
+    مسیر اصلی NestAPI است (متادیتا + لینک مستقیم mp3، بدون
+    کلید)؛ اگر NestAPI نشد یا لینک دانلود نداد، fallback
+    جستجوی یوتیوب (با کوکی لاگین‌شده، اگر باشد) + صدای GFw.
     برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
-    (خطای کلید یوتیوب اینجا برنمی‌گردد: اگر جستجوی موزیک
-    GFw خطا داد، به fallback یوتیوب می‌رویم و فقط وقتی همه
-    مسیرها نشد «error» برمی‌گردد.)
+    (خطای کلید یوتیوب اینجا برنمی‌گردد؛ فقط وقتی همه مسیرها
+    نشد «error» برمی‌گردد.)
     پیام پیشرفت هر ۵ ثانیه روی پیام کاور ویرایش می‌شود؛ آخرش
     کپشن کاور به اسم آهنگ و خواننده برمی‌گردد و پیام کاور
     پاک نمی‌شود (مثل ساندکلود)."""
@@ -3804,30 +3640,22 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
             kind_id = _extract_spotify_kind_and_id(resolved)
             if kind_id is None:
                 return "empty"
-            kind, sid = kind_id
-            entity = await asyncio.to_thread(
-                _fetch_spotify_embed_sync, kind, sid
+            # ۱) لینک → آهنگ با NestAPI (متادیتا + لینک mp3،
+            # بدون کلید)؛ آلبوم/پلی‌لیست → اولین آهنگ.
+            # خطای پیدا-نشدن → "empty" (مثلاً آهنگ حذف شده)،
+            # هر خطای دیگر NestAPI → "error".
+            nestapi_data, nestapi_err = await asyncio.to_thread(
+                _nestapi_spotify_sync, resolved
             )
-            if not entity:
+            if nestapi_data is None:
+                if nestapi_err in ("TRACK_NOT_FOUND", "NOT_FOUND"):
+                    return "empty"
+                return "error"
+            nestapi_track = _nestapi_first_track(nestapi_data)
+            if nestapi_track is None:
                 return "empty"
-            if (entity.get("type") or "") in ("album", "playlist"):
-                first_uri = ""
-                for item in entity.get("trackList") or []:
-                    if isinstance(item, dict) and str(
-                        item.get("uri") or ""
-                    ).startswith("spotify:track:"):
-                        first_uri = str(item["uri"])
-                        break
-                if not first_uri:
-                    return "empty"
-                track_id = first_uri.split(":")[-1]
-                entity = await asyncio.to_thread(
-                    _fetch_spotify_embed_sync, "track", track_id
-                )
-                if not entity:
-                    return "empty"
-            title, artist, cover_url, duration_ms = (
-                _spotify_parse_entity(entity)
+            title, artist, cover_url, duration_ms, nestapi_dl = (
+                nestapi_track
             )
             if not title:
                 return "error"
@@ -3868,46 +3696,28 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
             audio_mp3: Path | None = None
             query = f"{artist} - {title}" if artist else title
 
-            # ۴الف) جستجوی موزیک GFw (مسیر اصلی روی ریل‌وی)
-            # اگر جستجوی موزیک خطا داد (مثلاً 401 چون کلید
-            # یوتیوب برای موزیک معتبر نیست)، زود برنمی‌گردیم —
-            # به ۴ب می‌رویم؛ فقط وقتی همه مسیرها نشد «error»
-            # برمی‌گردد (هرگز متن خطای کلید یوتیوب برای اسپاتیفای
-            # نشان داده نمی‌شود).
-            if GFWDEV_MUSIC_API_KEY:
-                tracks, gfw_err = await asyncio.to_thread(
-                    _gfw_music_search_sync, query, GFWDEV_MUSIC_API_KEY
+            # ۴) NestAPI: لینک مستقیم mp3 (مسیر اصلی). فایل
+            # معمولاً خودش mp3 است (_spotify_audio_to_mp3_sync
+            # آن را همان‌طور برمی‌گرداند)؛ اگر mp3 نبود تبدیل
+            # می‌شود. اگر دانلودش نشد، به ۴ب می‌رویم.
+            if nestapi_dl:
+                raw = subdir / "audio.bin"
+                ok = await asyncio.to_thread(
+                    _download_url_sync, nestapi_dl, raw, tracker
                 )
-                if gfw_err:
-                    logger.warning(
-                        "GFw music search failed (%s); falling back "
-                        "to YouTube search", gfw_err
+                if ok and raw.is_file() and raw.stat().st_size > 0:
+                    audio_mp3 = await asyncio.to_thread(
+                        _spotify_audio_to_mp3_sync,
+                        raw, subdir / "audio.mp3",
+                        tracker, duration_ms,
                     )
-                    tracks = []
-                picked = _gfw_pick_music_track(tracks, title, artist)
-                if picked is not None:
-                    stream_url = _gfw_music_track_stream_url(picked)
-                    if stream_url is None:
-                        tid = _gfw_music_track_id(picked)
-                        if tid:
-                            stream_url = (
-                                f"{GFWDEV_MUSIC_STREAM_URL}/"
-                                f"{quote(tid, safe='')}"
-                                f"?api_key={quote(GFWDEV_MUSIC_API_KEY, safe='')}"
-                            )
-                    if stream_url:
-                        raw = subdir / "audio.bin"
-                        ok = await asyncio.to_thread(
-                            _download_url_sync, stream_url, raw, tracker
-                        )
-                        if ok and raw.is_file() and raw.stat().st_size > 0:
-                            audio_mp3 = await asyncio.to_thread(
-                                _spotify_audio_to_mp3_sync,
-                                raw, subdir / "audio.mp3",
-                                tracker, duration_ms,
-                            )
+                if audio_mp3 is None:
+                    logger.warning(
+                        "NestAPI download failed for %s; falling "
+                        "back to YouTube search", url
+                    )
 
-            # ۴ب) یوتیوب با GFw (اگر جستجوی موزیک نشد)
+            # ۴ب) یوتیوب با GFw (اگر NestAPI نشد)
             if audio_mp3 is None:
                 yt_url = await asyncio.to_thread(
                     _search_youtube_url_sync, query
