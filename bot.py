@@ -67,16 +67,11 @@ from telegram.ext import (
 # با مسیر معمولی Bot API کار کند.
 try:
     from telethon import TelegramClient
-    from telethon.errors import SessionPasswordNeededError
     from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
 except ImportError:  # pragma: no cover - telethon not installed
     TelegramClient = None  # type: ignore[assignment]
     StringSession = None  # type: ignore[assignment]
-
-    class SessionPasswordNeededError(Exception):  # type: ignore[no-redef]
-        """جایگزین ساختگی؛ فقط وقتی Telethon نصب نیست استفاده می‌شود."""
-
     TELETHON_AVAILABLE = False
 
 # curl-cffi برای impersonation مرورگر در yt-dlp لازم است؛ اگر نصب نباشد،
@@ -300,22 +295,18 @@ def _progress_text(pct: int, phase: str = "download") -> str:
 # ---------------------------------------------------------------------------
 # سشن مشترک Telethon — یکی برای همه کاربرها
 # ---------------------------------------------------------------------------
-# سشن از سه جا می‌تواند بیاید (به ترتیب اولویت):
-# ۱) حافظه — ساخته‌شده با /makesession
-# ۲) متغیر محیطی TELETHON_SESSION_STRING
-# ۳) فایل /data/telethon_session.txt روی Volume ریل‌وی
-# سشن مال یک نفر نیست؛ هر کسی /makesession را بزند، همین یک سشن
-# مشترک را می‌سازد/جایگزین می‌کند و همه کاربرها از همان استفاده می‌کنند.
+# سشن فقط از دو جا می‌تواند بیاید (به ترتیب اولویت):
+# ۱) متغیر محیطی TELETHON_SESSION_STRING
+# ۲) فایل /data/telethon_session.txt روی Volume ریل‌وی
+# سشن را با get_session.py (روی کامپیوتر) می‌سازی و رشته‌اش را
+# توی Variables ریل‌وی می‌گذاری؛ دستور /makesession حذف شده است.
 TELETHON_SESSION_FILE = Path(
     os.environ.get("TELETHON_SESSION_FILE", "/data/telethon_session.txt")
 )
-_RUNTIME_SESSION_STRING: str | None = None
 
 
 def get_telethon_session_string() -> str:
     """رشته سشن مشترک Telethon؛ خالی اگر هیچ‌جا نباشد."""
-    if _RUNTIME_SESSION_STRING:
-        return _RUNTIME_SESSION_STRING
     env_session = os.environ.get("TELETHON_SESSION_STRING", "").strip()
     if env_session:
         return env_session
@@ -341,22 +332,8 @@ def _telethon_api_credentials() -> tuple[int, str] | None:
     return api_id, api_hash
 
 
-def _save_telethon_session(session_str: str) -> bool:
-    """سشن مشترک را توی حافظه و فایل ذخیره می‌کند.
-    True اگر فایل هم ذخیره شد، False اگر فقط حافظه شد."""
-    global _RUNTIME_SESSION_STRING
-    _RUNTIME_SESSION_STRING = session_str
-    try:
-        TELETHON_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TELETHON_SESSION_FILE.write_text(session_str, encoding="utf-8")
-        return True
-    except OSError:
-        logger.exception("Could not save Telethon session file")
-        return False
-
-
 def telethon_configured() -> bool:
-    """True اگر API ID/Hash ست باشند و سشن مشترک از حافظه، متغیر
+    """True اگر API ID/Hash ست باشند و سشن مشترک از متغیر
     محیطی یا فایل بیاید و کتابخانه نصب باشد."""
     if not TELETHON_AVAILABLE:
         return False
@@ -474,7 +451,7 @@ async def send_via_telethon_bot(chat_id: int, path: Path, caption: str | None,
     سقف ارسال ۲ گیگابایت است، نه ۵۰ مگ Bot API. این همان راهی
     است که ربات‌های دانلودر روی سرور خودشان استفاده می‌کردند:
     سقف ۵۰ مگ فقط برای Bot API از طریق HTTP است؛ MTProto آن را
-    ندارد. نیازی به سشن حساب کاربری (/makesession) ندارد و فقط
+    ندارد. نیازی به سشن حساب کاربری ندارد و فقط
     به TELETHON_API_ID و TELETHON_API_HASH و BOT_TOKEN نیاز دارد.
     در صورت هر خطایی False برمی‌گرداند تا مسیر بعدی امتحان شود.
     نکته: ربات باید عضو گروه باشد (برای ارسال به گروه) یا کاربر
@@ -551,8 +528,7 @@ START_TEXT = """سلام! 👋
 لینک بفرست تا دانلودش کنم:
 📸 اینستاگرام، تیک‌تاک و پینترست
 🎬 یوتیوب و پورن‌هاب — کیفیت رو انتخاب می‌کنی
-🎵 ساندکلود
-/makesession — فقط پی‌وی"""
+🎵 ساندکلود و اسپاتیفای"""
 
 TOO_BIG_TEXT = "ویدیو خیلی بزرگه. 😕"
 
@@ -622,6 +598,8 @@ def detect_platform(url: str) -> str | None:
         return "youtube"
     if "soundcloud.com" in low:
         return "soundcloud"
+    if "spotify.com" in low or "spotify.link" in low:
+        return "spotify"
     if "pinterest." in low or "pin.it" in low:
         return "pinterest"
     return None
@@ -635,6 +613,7 @@ _PLATFORM_REFERERS = {
     "pinterest": "https://www.pinterest.com/",
     "youtube": "https://www.youtube.com/",
     "soundcloud": "https://soundcloud.com/",
+    "spotify": "https://open.spotify.com/",
 }
 
 
@@ -1766,8 +1745,12 @@ async def do_tiktok_download(bot, chat_id: int, url: str) -> str:
 # - پین ویدیویی: videos.video_list فرمت‌های mp4 را می‌دهد؛ دانلودش
 #   مثل تیک‌تاک با yt-dlp انجام می‌شود.
 # - پین عکسی: images.orig کیفیت اصلی است (گاهی ‎.heic است)؛ پین
-#   چندعکسی صفحه‌های story_pin_data است و هر صفحه یک عکس دارد
-#   (image.images.originals). همه عکس‌ها به ترتیب صفحه جمع می‌شوند
+#   چندعکسی یا صفحه‌های story_pin_data است (هر صفحه یک عکس دارد،
+#   image.images.originals) یا یک carousel است
+#   (carousel_data.carousel_slots — هر اسلات یک عکس جدا، بدون
+#   orig؛ URL اصلی از روی signature همان عکس ساخته می‌شود و
+#   پسوند درست با تلاش به‌ترتیب پیدا می‌شود، چون پسوند نسخه
+#   736x با پسوند اصلی یکی نیست). همه عکس‌ها به ترتیب جمع می‌شوند
 #   و به‌صورت یک آلبوم فرستاده می‌شوند.
 # تست زنده (از همین VM، بدون لاگین): API جواب می‌دهد؛ ویدیوی
 # Origami واقعاً دانلود شد (۵٫۲ مگ mp4)؛ عکس اصلی jpg و heic هر دو
@@ -1848,11 +1831,25 @@ def _fetch_pinterest_pin_sync(pin_id: str) -> dict | None:
 
 def _pinterest_has_video(data: dict) -> bool:
     """True اگر پین ویدیو داشته باشد (video_list پر باشد).
-    is_video قابل اعتماد نیست — برای پین ویدیویی هم False می‌آید."""
+    is_video قابل اعتماد نیست — برای پین ویدیویی هم False می‌آید.
+    ویدیو یا توی videos.video_list است یا توی صفحه‌های story
+    (استوری‌پین ویدیویی videos خالی دارد ولی بلاک ویدیو دارد —
+    اگر این را نگیریم، ربات به‌جای ویدیو فقط کاورش را می‌فرستد)."""
     videos = data.get("videos")
-    if not isinstance(videos, dict):
-        return False
-    return bool(videos.get("video_list"))
+    if isinstance(videos, dict) and videos.get("video_list"):
+        return True
+    story = data.get("story_pin_data")
+    if isinstance(story, dict):
+        for page in story.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            for block in page.get("blocks") or []:
+                if not isinstance(block, dict):
+                    continue
+                video = block.get("video")
+                if isinstance(video, dict) and video.get("video_list"):
+                    return True
+    return False
 
 
 def _pinterest_image_signature(url: str) -> str:
@@ -1885,9 +1882,14 @@ def _largest_image_url(images: dict | None) -> str | None:
 
 def _pinterest_pick_images(data: dict) -> list[list[str]]:
     """عکس‌های پین با کیفیت اصلی؛ هر عکس یک فهرست آدرس جایگزین
-    دارد (بهترین اول). ترتیب: اول صفحه‌های story (پین چندعکسی)،
-    بعد عکس اصلی پین. عکس تکراری (یک هش، دو پسوند) فقط یک بار
-    می‌آید — آدرس دومش جایگزین همان عکس می‌شود."""
+    دارد (بهترین اول). ترتیب: اول اسلات‌های carousel (پین
+    چندعکسی)، بعد صفحه‌های story، بعد عکس اصلی پین. عکس تکراری
+    (یک هش، دو پسوند) فقط یک بار می‌آید — آدرس دومش جایگزین همان
+    عکس می‌شود. اسلات carousel نسخه orig ندارد (فقط تا 736x)،
+    پس URL اصلی‌اش از روی signature ساخته می‌شود و پسوند درست
+    (jpg/png/heic/…) با تلاش به‌ترتیب در دانلود پیدا می‌شود —
+    پسوند نسخه کوچک با پسوند اصلی یکی نیست و نمی‌شود از روی آن
+    حدس زد."""
     images: list[list[str]] = []
     by_sig: dict[str, list[str]] = {}
 
@@ -1901,6 +1903,31 @@ def _pinterest_pick_images(data: dict) -> list[list[str]]:
         else:
             by_sig[sig] = [u]
             images.append(by_sig[sig])
+
+    def _add_carousel_slot(sized_url: str | None) -> None:
+        """یک اسلات carousel: اول آدرس‌های originals با پسوندهای
+        محتمل (به‌ترتیب)، بعد همان نسخه کوچک به‌عنوان fallback —
+        اگر هیچ originals‌ای نشد، همان 736x دانلود می‌شود تا عکس
+        از دست نرود."""
+        if not sized_url:
+            return
+        sig = _pinterest_image_signature(sized_url)
+        if len(sig) >= 6:
+            for ext in ("jpg", "png", "heic", "jpeg", "webp"):
+                _add(
+                    "https://i.pinimg.com/originals/"
+                    f"{sig[0:2]}/{sig[2:4]}/{sig[4:6]}/{sig}.{ext}"
+                )
+        _add(sized_url)
+
+    carousel = data.get("carousel_data")
+    if isinstance(carousel, dict):
+        for slot in carousel.get("carousel_slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            _add_carousel_slot(
+                _largest_image_url(slot.get("images"))
+            )
 
     story = data.get("story_pin_data")
     if isinstance(story, dict):
@@ -3275,6 +3302,626 @@ async def do_soundcloud_download(bot, chat_id: int, url: str) -> str:
                     pass
 
 
+# ---------------------------------------------------------------------------
+# اسپاتیفای — دقیقاً مثل ساندکلود: اول کاور آهنگ با اسم آهنگ و
+# خواننده، بعد فایل صوتی mp3 با عنوان و خواننده درست.
+# ---------------------------------------------------------------------------
+# صدای اسپاتیفای DRM دارد و دانلود مستقیم از خود اسپاتیفای ممکن
+# نیست؛ پس متادیتا (اسم آهنگ، خواننده، کاور) از صفحه embed اسپاتیفای
+# (بدون لاگین، __NEXT_DATA__) گرفته می‌شود و صدا اول از جستجوی
+# موزیک GFw می‌آید؛ اگر آن نشد، یوتیوب با GFw (کیفیت صوتی) و در
+# آخر yt-dlp مستقیم. پری‌ویو ۳۰ ثانیه‌ای اسپاتیفای استفاده نمی‌شود
+# (آهنگ کامل نیست).
+SPOTIFY_EMBED_BASE = "https://open.spotify.com/embed"
+SPOTIFY_REFERER = "https://open.spotify.com/"
+GFWDEV_MUSIC_SEARCH_URL = "https://api.gfwdev.ir/music/search"
+GFWDEV_MUSIC_STREAM_URL = "https://api.gfwdev.ir/music/stream"
+
+
+def _extract_spotify_kind_and_id(url: str) -> tuple[str, str] | None:
+    """(kind, id) لینک اسپاتیفای: kind یکی از
+    track | album | playlist | episode است. None اگر لینک آهنگ/
+    آلبوم/پلی‌لیست نباشد (مثلاً artist یا صفحه جستجو)."""
+    try:
+        parts = urlparse(url)
+    except Exception:
+        return None
+    segs = [s for s in (parts.path or "").split("/") if s]
+    # /intl-<xx>/track/<id> → سگمنت زبان را رد کن
+    if len(segs) >= 3 and segs[0].startswith("intl-"):
+        segs = segs[1:]
+    if len(segs) < 2:
+        return None
+    kind, sid = segs[-2], segs[-1]
+    if kind not in ("track", "album", "playlist", "episode"):
+        return None
+    sid = sid.strip()
+    if not sid or len(sid) > 64:
+        return None
+    return kind, sid
+
+
+def _resolve_spotify_url_sync(url: str) -> str | None:
+    """لینک کوتاه spotify.link را باز می‌کند و URL نهایی را
+    برمی‌گرداند؛ برای لینک معمولی همان URL. None اگر باز نشد."""
+    if "spotify.link" not in url.lower():
+        return url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": CHROME_USER_AGENT,
+                "Referer": SPOTIFY_REFERER,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            try:
+                resp.read(1)
+            except Exception:
+                pass
+            return resp.geturl()
+    except Exception:
+        logger.warning("spotify.link resolve failed for %s", url)
+        return None
+
+
+def _fetch_spotify_embed_sync(kind: str, sid: str) -> dict | None:
+    """entity صفحه embed اسپاتیفای (بدون لاگین) را برمی‌گرداند؛
+    None اگر صفحه 404 بود یا ساختارش عوض شده بود."""
+    embed_url = f"{SPOTIFY_EMBED_BASE}/{kind}/{sid}"
+    try:
+        req = urllib.request.Request(
+            embed_url,
+            headers={"User-Agent": CHROME_USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        logger.warning("Spotify embed HTTP %s for %s/%s", e.code, kind, sid)
+        return None
+    except Exception:
+        logger.warning("Spotify embed fetch failed for %s/%s", kind, sid)
+        return None
+    m = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S
+    )
+    if not m:
+        logger.warning(
+            "Spotify embed: no __NEXT_DATA__ for %s/%s", kind, sid
+        )
+        return None
+    try:
+        data = json.loads(m.group(1))
+        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    except Exception:
+        logger.warning(
+            "Spotify embed: unexpected JSON for %s/%s", kind, sid
+        )
+        return None
+    return entity if isinstance(entity, dict) else None
+
+
+def _spotify_pick_cover(images) -> str | None:
+    """بزرگ‌ترین کاور از visualIdentity.image (بر اساس maxWidth)."""
+    best = None
+    best_area = -1
+    for im in images or []:
+        if not isinstance(im, dict):
+            continue
+        u = im.get("url")
+        if not u:
+            continue
+        area = (im.get("maxWidth") or 0) * (im.get("maxHeight") or 0)
+        if area >= best_area:
+            best_area = area
+            best = u
+    return best
+
+
+def _spotify_parse_entity(
+    entity: dict,
+) -> tuple[str, str, str | None, int | None]:
+    """(title, artist, cover_url, duration_ms) از entity صفحه embed.
+    خواننده: همه artists با «, » جدا می‌شوند؛ اگر نبود، خالی
+    (هیچ‌وقت «Unknown» برنمی‌گردد)."""
+    title = str(entity.get("title") or entity.get("name") or "").strip()
+    artists: list[str] = []
+    for a in entity.get("artists") or []:
+        if isinstance(a, dict):
+            name = str(a.get("name") or "").strip()
+            if name:
+                artists.append(name)
+    artist = ", ".join(artists)
+    cover = _spotify_pick_cover(
+        (entity.get("visualIdentity") or {}).get("image")
+    )
+    duration = entity.get("duration")
+    duration_ms = int(duration) if isinstance(duration, int) else None
+    return title, artist, cover, duration_ms
+
+
+def _normalize_music_text(s: str) -> str:
+    """نرمال‌سازی برای مقایسه عنوان/خواننده: حروف کوچک، بدون
+    علائم نگارشی و فاصله‌های اضافه."""
+    s = (s or "").lower()
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _gfw_music_search_sync(
+    query: str, api_key: str, timeout: int = 60
+) -> tuple[list, str]:
+    """جستجوی موزیک با وب‌سرویس GFw (فقط stdlib).
+    برمی‌گرداند: (فهرست آهنگ‌ها یا []، کد خطا یا "").
+    کد خطا: "no_key" (کلید ست نشده) | "bad_key" (کلید نامعتبر)
+    | "error" | "unavailable".
+    شکل پاسخ توی مستندات GFw نمونه JSON ندارد، پس پارس دفاعی
+    است: data می‌تواند لیست باشد، یا دیکشنری با کلید results /
+    tracks / items / songs / list، یا یک آهنگ تکی؛ هر شکل
+    غیرمنتظره لاگ می‌شود تا اولین خطای واقعی قابل تشخیص باشد."""
+    if not api_key:
+        return [], "no_key"
+    api_url = (
+        f"{GFWDEV_MUSIC_SEARCH_URL}?q={quote(query, safe='')}"
+        f"&api_key={quote(api_key, safe='')}"
+    )
+    req = urllib.request.Request(
+        api_url, headers={"User-Agent": CHROME_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+            try:
+                msg = str(json.loads(body).get("message") or "")
+            except Exception:
+                msg = body
+        except Exception:
+            pass
+        logger.warning("GFw music search HTTP %s: %s", e.code, msg[:200])
+        return [], _gfw_api_error_code(msg, e.code)
+    except Exception:
+        logger.exception("GFw music search request failed")
+        return [], "error"
+    if status != 200:
+        return [], "error"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        logger.warning("GFw music search returned invalid JSON")
+        return [], "error"
+    if not isinstance(payload, dict):
+        return [], "error"
+    if not payload.get("status"):
+        return [], _gfw_api_error_code(
+            str(payload.get("message") or ""), None
+        )
+    data = payload.get("data")
+    tracks: list = []
+    if isinstance(data, list):
+        tracks = data
+    elif isinstance(data, dict):
+        for key in ("results", "tracks", "items", "songs", "list"):
+            if isinstance(data.get(key), list):
+                tracks = data[key]
+                break
+        else:
+            # یک آهنگ تکی
+            if data.get("id") or data.get("track_id"):
+                tracks = [data]
+    if not isinstance(tracks, list):
+        tracks = []
+    tracks = [t for t in tracks if isinstance(t, dict)]
+    if not tracks and data is not None:
+        logger.warning(
+            "GFw music search: unexpected data shape keys=%s",
+            list(data.keys())
+            if isinstance(data, dict) else type(data).__name__,
+        )
+    return tracks, ""
+
+
+def _gfw_music_track_id(track: dict) -> str | None:
+    """آیدی آهنگ از نتیجه جستجوی موزیک GFw."""
+    for key in ("track_id", "id", "trackId"):
+        v = track.get(key)
+        if v:
+            return str(v)
+    return None
+
+
+def _gfw_music_track_stream_url(track: dict) -> str | None:
+    """لینک مستقیم استریم از نتیجه جستجو، اگر خودش داده باشد.
+    «url» فقط وقتی قبول می‌شود که لینک استریم GFw یا فایل صوتی
+    باشد — نه صفحه اسپاتیفای یا صفحه وب."""
+    for key in ("stream_url", "download_url", "stream"):
+        v = track.get(key)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    v = track.get("url")
+    if isinstance(v, str) and v.startswith("http"):
+        low = v.lower()
+        if "spotify.com" in low:
+            return None
+        if "/music/stream/" in low or low.split("?")[0].endswith(
+            (".mp3", ".ogg", ".m4a", ".aac", ".flac", ".wav", ".opus")
+        ):
+            return v
+    return None
+
+
+def _gfw_pick_music_track(
+    tracks: list, title: str, artist: str
+) -> dict | None:
+    """بهترین نتیجه جستجو: عنوان باید با آهنگ اسپاتیفای بخواند
+    (وگرنه None تا fallback امتحان شود)؛ تطابق خواننده امتیاز
+    می‌دهد ولی به‌تنهایی کافی نیست."""
+    want_title = _normalize_music_text(title)
+    want_artist = _normalize_music_text(artist)
+    best = None
+    best_score = -1
+    for t in tracks:
+        t_title = str(t.get("title") or t.get("name") or "")
+        t_artist = t.get("artist") or t.get("artists") or ""
+        if isinstance(t_artist, list):
+            t_artist = ", ".join(
+                str(
+                    a.get("name") if isinstance(a, dict) else a or ""
+                )
+                for a in t_artist
+            )
+        t_artist = str(t_artist)
+        n_title = _normalize_music_text(t_title)
+        n_artist = _normalize_music_text(t_artist)
+        score = 0
+        if want_title and n_title:
+            if (
+                n_title == want_title
+                or want_title in n_title
+                or n_title in want_title
+            ):
+                score += 2
+            elif set(want_title.split()) & set(n_title.split()):
+                score += 1
+        if want_artist and n_artist:
+            if want_artist in n_artist or n_artist in want_artist:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best = t
+    if best is None or best_score < 2:
+        return None
+    return best
+
+
+def _search_youtube_url_sync(query: str) -> str | None:
+    """اولین نتیجه جستجوی یوتیوب برای «خواننده - آهنگ» با yt-dlp.
+    None اگر جستجو نشد (IP ریل‌وی یوتیوب را بلاک می‌کند)."""
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extract_flat": True,
+            "socket_timeout": 30,
+            "http_headers": {
+                "User-Agent": CHROME_USER_AGENT,
+                "Referer": "https://www.youtube.com/",
+            },
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+    except Exception:
+        logger.warning("YouTube search failed for %s", query)
+        return None
+    if not isinstance(info, dict):
+        return None
+    entries = [
+        e for e in info.get("entries") or [] if isinstance(e, dict)
+    ]
+    if not entries:
+        return None
+    vid = entries[0].get("id")
+    if not vid:
+        return None
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
+def _spotify_audio_to_mp3_sync(
+    raw: Path, out: Path, tracker=None,
+    duration_ms: int | None = None,
+) -> Path | None:
+    """فایل صوتی دانلودشده (mp3/ogg/m4a/...) را به mp3 تبدیل
+    می‌کند؛ اگر خودش mp3 بود، همان را برمی‌گرداند. None اگر نشد."""
+    try:
+        if not raw.is_file() or raw.stat().st_size == 0:
+            return None
+        with open(raw, "rb") as f:
+            head = f.read(3)
+        if head[:3] == b"ID3" or (
+            len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0
+        ):
+            if raw.suffix.lower() != ".mp3":
+                mp3 = raw.with_suffix(".mp3")
+                raw.rename(mp3)
+                return mp3
+            return raw
+        duration_s = duration_ms / 1000 if duration_ms else None
+        rc = _convert_audio_to_mp3_sync(raw, out, duration_s, tracker)
+        if rc == 0 and out.is_file() and out.stat().st_size > 0:
+            return out
+        return None
+    except Exception:
+        logger.exception("Spotify audio to mp3 failed")
+        return None
+
+
+async def _download_spotify_audio_via_youtube_gfw(
+    yt_url: str, subdir: Path, tracker
+) -> Path | None:
+    """صدای یک ویدیوی یوتیوب با وب‌سرویس GFw (کیفیت صوتی)؛
+    فایل صوتی خام (m4a/webm) را برمی‌گرداند یا None."""
+    data, err = await asyncio.to_thread(
+        _gfw_youtube_info_sync, yt_url, GFWDEV_API_KEY
+    )
+    if data is None:
+        logger.warning(
+            "GFw YouTube info failed for Spotify fallback: %s", err
+        )
+        return None
+    audio_entry = _gfw_pick_audio(
+        (data.get("downloads") or {}).get("audio") or []
+    )
+    if audio_entry is None:
+        return None
+    fmt = (audio_entry.get("format") or "m4a").lower()
+    dest = subdir / f"audio.{fmt}"
+    ok = await _download_gfw_file(
+        yt_url, audio_entry, dest, tracker, "audio"
+    )
+    if not ok or not dest.is_file() or dest.stat().st_size == 0:
+        return None
+    return dest
+
+
+async def do_spotify_download(bot, chat_id: int, url: str) -> str:
+    """دانلود اسپاتیفای — دقیقاً مثل ساندکلود: اول کاور آهنگ با
+    اسم آهنگ و خواننده، بعد فایل صوتی mp3 با عنوان و خواننده درست.
+    اگر لینک آلبوم/پلی‌لیست باشد، فقط اولین آهنگ گرفته می‌شود.
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'no_key'
+    | 'bad_key'
+    پیام پیشرفت هر ۵ ثانیه روی پیام کاور ویرایش می‌شود؛ آخرش
+    کپشن کاور به اسم آهنگ و خواننده برمی‌گردد و پیام کاور
+    پاک نمی‌شود (مثل ساندکلود)."""
+    with tempfile.TemporaryDirectory(prefix="sp-") as tmpdir:
+        tracker = ProgressTracker()
+        done = asyncio.Event()
+        progress_msg = None
+        is_photo = False
+        watcher = None
+
+        def _start_watcher() -> None:
+            nonlocal watcher
+            if progress_msg is not None:
+                watcher = asyncio.create_task(
+                    _watch_progress(
+                        bot, chat_id, progress_msg.message_id,
+                        tracker, done, is_photo,
+                    )
+                )
+
+        try:
+            # ۰) پیام پیشرفت از همان اول (فاز آماده‌سازی).
+            try:
+                progress_msg = await bot.send_message(
+                    chat_id=chat_id, text=_progress_text(0, "info"),
+                )
+                _start_watcher()
+            except Exception:
+                progress_msg = None
+                logger.exception("Could not send progress message")
+
+            # ۱) لینک → آهنگ (آلبوم/پلی‌لیست → اولین آهنگ)
+            resolved = await asyncio.to_thread(
+                _resolve_spotify_url_sync, url
+            )
+            if not resolved:
+                return "empty"
+            kind_id = _extract_spotify_kind_and_id(resolved)
+            if kind_id is None:
+                return "empty"
+            kind, sid = kind_id
+            entity = await asyncio.to_thread(
+                _fetch_spotify_embed_sync, kind, sid
+            )
+            if not entity:
+                return "empty"
+            if (entity.get("type") or "") in ("album", "playlist"):
+                first_uri = ""
+                for item in entity.get("trackList") or []:
+                    if isinstance(item, dict) and str(
+                        item.get("uri") or ""
+                    ).startswith("spotify:track:"):
+                        first_uri = str(item["uri"])
+                        break
+                if not first_uri:
+                    return "empty"
+                track_id = first_uri.split(":")[-1]
+                entity = await asyncio.to_thread(
+                    _fetch_spotify_embed_sync, "track", track_id
+                )
+                if not entity:
+                    return "empty"
+            title, artist, cover_url, duration_ms = (
+                _spotify_parse_entity(entity)
+            )
+            if not title:
+                return "error"
+            final_caption = f"🎵 {title}"
+            if artist:
+                final_caption += f"\n👤 {artist}"
+
+            # ۲) کاور (بزرگ‌ترین کاور موجود)
+            cover = await asyncio.to_thread(
+                _download_cover_sync,
+                cover_url, tmpdir, SPOTIFY_REFERER,
+            )
+
+            # ۳) اگر کاور هست، پیام متنی را به عکس کاور تبدیل کن؛
+            # اگر نیست، همان پیام متنی پیشرفت می‌ماند.
+            if cover is not None and progress_msg is not None:
+                try:
+                    if watcher is not None:
+                        watcher.cancel()
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                try:
+                    with open(cover, "rb") as f:
+                        progress_msg = await bot.send_photo(
+                            chat_id=chat_id, photo=f,
+                            caption=tracker.display_text(),
+                        )
+                    is_photo = True
+                    _start_watcher()
+                except Exception:
+                    progress_msg = None
+                    logger.exception("Could not send cover progress photo")
+
+            # ۴) دانلود صدا → mp3
+            subdir = Path(tmpdir) / "audio"
+            subdir.mkdir(parents=True, exist_ok=True)
+            audio_mp3: Path | None = None
+            query = f"{artist} - {title}" if artist else title
+
+            # ۴الف) جستجوی موزیک GFw (مسیر اصلی روی ریل‌وی)
+            if GFWDEV_API_KEY:
+                tracks, gfw_err = await asyncio.to_thread(
+                    _gfw_music_search_sync, query, GFWDEV_API_KEY
+                )
+                if gfw_err == "no_key":
+                    return "no_key"
+                if gfw_err == "bad_key":
+                    return "bad_key"
+                picked = _gfw_pick_music_track(tracks, title, artist)
+                if picked is not None:
+                    stream_url = _gfw_music_track_stream_url(picked)
+                    if stream_url is None:
+                        tid = _gfw_music_track_id(picked)
+                        if tid:
+                            stream_url = (
+                                f"{GFWDEV_MUSIC_STREAM_URL}/"
+                                f"{quote(tid, safe='')}"
+                                f"?api_key={quote(GFWDEV_API_KEY, safe='')}"
+                            )
+                    if stream_url:
+                        raw = subdir / "audio.bin"
+                        ok = await asyncio.to_thread(
+                            _download_url_sync, stream_url, raw, tracker
+                        )
+                        if ok and raw.is_file() and raw.stat().st_size > 0:
+                            audio_mp3 = await asyncio.to_thread(
+                                _spotify_audio_to_mp3_sync,
+                                raw, subdir / "audio.mp3",
+                                tracker, duration_ms,
+                            )
+
+            # ۴ب) یوتیوب با GFw (اگر جستجوی موزیک نشد)
+            if audio_mp3 is None:
+                yt_url = await asyncio.to_thread(
+                    _search_youtube_url_sync, query
+                )
+                if yt_url:
+                    if GFWDEV_API_KEY:
+                        raw = await _download_spotify_audio_via_youtube_gfw(
+                            yt_url, subdir, tracker
+                        )
+                        if raw is not None:
+                            audio_mp3 = await asyncio.to_thread(
+                                _spotify_audio_to_mp3_sync,
+                                raw, subdir / "audio.mp3",
+                                tracker, duration_ms,
+                            )
+                    else:
+                        # بدون کلید GFw: yt-dlp مستقیم (روی ریل‌وی
+                        # احتمالاً بلاک است؛ آخرین راه)
+                        try:
+                            _dl_title, files = await asyncio.to_thread(
+                                _download_audio_once,
+                                yt_url, str(subdir), tracker,
+                            )
+                            mp3s = [
+                                p for p in files
+                                if p.suffix.lower() == ".mp3"
+                            ]
+                            if mp3s:
+                                audio_mp3 = mp3s[0]
+                        except Exception:
+                            logger.exception(
+                                "yt-dlp audio failed for Spotify %s", url
+                            )
+            if audio_mp3 is None:
+                return "error"
+
+            # ۵) ارسال آهنگ (با همان کاور به‌عنوان thumbnail)
+            audio_duration: int | None = None
+            if duration_ms:
+                audio_duration = int(duration_ms / 1000)
+            if not audio_duration:
+                dur = await asyncio.to_thread(
+                    _probe_duration_seconds, audio_mp3
+                )
+                if dur:
+                    audio_duration = int(dur)
+            sent = await _deliver(
+                bot, chat_id, tmpdir, title, [audio_mp3], False,
+                "title", thumb=cover, tracker=tracker,
+                audio_title=title[:200],
+                audio_performer=artist or None,
+                audio_caption=final_caption,
+                audio_duration=audio_duration,
+            )
+            if not sent:
+                return "empty"
+
+            # ۶) کپشن پیام کاور را به اسم آهنگ و خواننده برگردان؛
+            # پیام کاور می‌ماند (پاک نمی‌شود).
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    if is_photo:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            caption=final_caption,
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=progress_msg.message_id,
+                            text=final_caption,
+                        )
+                except Exception:
+                    pass
+                progress_msg = None
+            return "ok"
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.cancel()
+            if progress_msg is not None:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+
 async def _background_download(bot, chat_id: int, url: str,
                                platform: str, height: int | None = None,
                                audio: bool = False) -> None:
@@ -3307,6 +3954,8 @@ async def _background_download(bot, chat_id: int, url: str,
             result = await do_pinterest_download(bot, chat_id, url)
         elif platform == "soundcloud":
             result = await do_soundcloud_download(bot, chat_id, url)
+        elif platform == "spotify":
+            result = await do_spotify_download(bot, chat_id, url)
         else:
             result = await do_instagram_download(bot, chat_id, url)
     except Exception:
@@ -3515,206 +4164,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(help_text())
 
 
-# ---------------------------------------------------------------------------
-# ساخت سشن مشترک Telethon با چت (/makesession) — فقط پی‌وی، بدون ترمینال
-# ---------------------------------------------------------------------------
-
-def _normalize_phone(raw: str) -> str | None:
-    """شماره را به فرمت +کدکشور درمی‌آورد؛ اگر نشد None."""
-    phone = re.sub(r"[\s\-()]", "", raw.strip())
-    if phone.startswith("00"):
-        phone = "+" + phone[2:]
-    if phone.startswith("0"):
-        return None
-    if not phone.startswith("+"):
-        phone = "+" + phone
-    if not re.fullmatch(r"\+\d{8,15}", phone):
-        return None
-    return phone
-
-
-async def _abort_makesession(update, context, text: str) -> None:
-    """کلاینت Telethon را قطع و وضعیت /makesession را پاک می‌کند."""
-    state = context.user_data.pop("makesession", None)
-    client = (state or {}).get("client")
-    if client is not None:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    await update.message.reply_text(text)
-
-
-async def _finish_makesession(update, context) -> None:
-    """سشن مشترک را ذخیره می‌کند (حافظه + فایل) و وضعیت را پاک می‌کند.
-    رشته سشن هیچ‌وقت توی چت فرستاده نمی‌شود."""
-    state = context.user_data.pop("makesession", {})
-    client = state.get("client")
-    if client is None:
-        await update.message.reply_text("دوباره /makesession بزن.")
-        return
-    session_str = None
-    try:
-        session_str = client.session.save()
-    except Exception:
-        logger.exception("Could not save Telethon session string")
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    if not session_str:
-        await update.message.reply_text("ذخیره نشد. دوباره /makesession بزن.")
-        return
-    saved_to_file = _save_telethon_session(session_str)
-    text = "انجام شد. ✅"
-    if not saved_to_file:
-        text += "\nبعد از ری‌استارت باید دوباره بسازی."
-    await update.message.reply_text(text)
-
-
-async def makesession_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """شروع ساخت سشن مشترک Telethon — فقط پی‌وی."""
-    msg = update.message
-    if msg is None:
-        return
-    if msg.chat.type != "private":
-        await msg.reply_text("فقط پی‌وی.")
-        return
-    if not TELETHON_AVAILABLE:
-        await msg.reply_text("Telethon نصب نیست.")
-        return
-    if _telethon_api_credentials() is None:
-        await msg.reply_text("API ID و Hash ست نیست.")
-        return
-    if telethon_configured():
-        context.user_data["makesession"] = {"step": "await_overwrite_confirm"}
-        await msg.reply_text(
-            "از قبل فعاله. جایگزین بشه؟\n«بله» یا «خیر»"
-        )
-        return
-    context.user_data["makesession"] = {"step": "await_phone"}
-    await msg.reply_text(
-        "شماره‌ت رو با کد کشور بفرست. (مثلاً +98...)\nبرای لغو «لغو» رو بفرست."
-    )
-
-
-async def handle_makesession_step(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> bool:
-    """یک پیام متنی را در جریان /makesession پردازش می‌کند.
-    True اگر پیام مصرف شد (و نباید به‌عنوان لینک پردازش شود)."""
-    msg = update.message
-    state = context.user_data.get("makesession")
-    if not state or msg is None or not msg.text:
-        return False
-    text = msg.text.strip()
-    step = state.get("step")
-
-    if text in ("لغو", "انصراف"):
-        await _abort_makesession(update, context, "لغو شد.")
-        return True
-
-    if step == "await_overwrite_confirm":
-        if text in ("بله", "آره", "yes", "Yes"):
-            context.user_data["makesession"] = {"step": "await_phone"}
-            await msg.reply_text("شماره‌ت رو با کد کشور بفرست.")
-        else:
-            await _abort_makesession(update, context, "لغو شد.")
-        return True
-
-    if step == "await_phone":
-        phone = _normalize_phone(text)
-        if phone is None:
-            await msg.reply_text("شماره درست نیست. با کد کشور بفرست.")
-            return True
-        creds = _telethon_api_credentials()
-        if creds is None:
-            await _abort_makesession(
-                update, context, "API ID و Hash ست نیست.",
-            )
-            return True
-        api_id, api_hash = creds
-        client = TelegramClient(StringSession(), api_id, api_hash)
-        try:
-            await client.connect()
-            sent = await client.send_code_request(phone)
-        except Exception:
-            logger.exception("Telethon send_code_request failed")
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            context.user_data.pop("makesession", None)
-            await msg.reply_text("نتونستم کد بفرستم. دوباره /makesession بزن.")
-            return True
-        state["step"] = "await_code"
-        state["phone"] = phone
-        state["client"] = client
-        state["phone_code_hash"] = sent.phone_code_hash
-        await msg.reply_text("کد ۵ رقمی رو بفرست.")
-        return True
-
-    if step == "await_code":
-        code = re.sub(r"[\s\-]", "", text)
-        if not re.fullmatch(r"\d{5}", code):
-            await msg.reply_text("کد باید ۵ رقم باشه.")
-            return True
-        client = state.get("client")
-        if client is None:
-            await _abort_makesession(
-                update, context, "قطع شد. دوباره /makesession بزن.",
-            )
-            return True
-        try:
-            await client.sign_in(
-                state.get("phone"), code,
-                phone_code_hash=state.get("phone_code_hash"),
-            )
-        except SessionPasswordNeededError:
-            state["step"] = "await_2fa"
-            await msg.reply_text("رمز دومرحله‌ای رو بفرست.")
-            return True
-        except Exception:
-            logger.exception("Telethon sign_in failed")
-            await _abort_makesession(
-                update, context, "کد اشتباهه. دوباره /makesession بزن.",
-            )
-            return True
-        await _finish_makesession(update, context)
-        return True
-
-    if step == "await_2fa":
-        client = state.get("client")
-        if client is None:
-            await _abort_makesession(
-                update, context, "قطع شد. دوباره /makesession بزن.",
-            )
-            return True
-        try:
-            await client.sign_in(password=msg.text)
-        except Exception:
-            logger.exception("Telethon 2FA sign_in failed")
-            await _abort_makesession(
-                update, context, "رمز اشتباهه. دوباره /makesession بزن.",
-            )
-            return True
-        await _finish_makesession(update, context)
-        return True
-
-    context.user_data.pop("makesession", None)
-    return False
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هر پیام متنی: لینک اینستا/تیک‌تاک/یوتیوب/پورن‌هاب/ساندکلود/پینترست
-    را پردازش کن؛ اگر نه، رد شو.
+    """هر پیام متنی: لینک اینستا/تیک‌تاک/یوتیوب/پورن‌هاب/ساندکلود/
+    اسپاتیفای/پینترست را پردازش کن؛ اگر نه، رد شو.
     دانلود در پس‌زمینه اجرا می‌شود تا ربات به بقیه دستورها جواب بدهد."""
     msg = update.message
     if msg is None or not msg.text:
-        return
-
-    if await handle_makesession_step(update, context):
         return
 
     url = find_url(msg.text)
@@ -3727,7 +4182,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not platform:
         if msg.chat.type == "private":
             await msg.reply_text(
-                "فقط اینستاگرام، تیک‌تاک، یوتیوب، پورن‌هاب، ساندکلود و پینترست."
+                "فقط اینستاگرام، تیک‌تاک، یوتیوب، پورن‌هاب، ساندکلود، اسپاتیفای و پینترست."
             )
         return
 
@@ -3741,7 +4196,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _offer_youtube_quality(update, context, url)
         return
 
-    # اینستاگرام، تیک‌تاک، ساندکلود و پینترست: دانلود مستقیم، در پس‌زمینه.
+    # اینستاگرام، تیک‌تاک، ساندکلود، اسپاتیفای و پینترست: دانلود مستقیم، در پس‌زمینه.
     asyncio.create_task(
         _background_download(context.bot, msg.chat.id, url, platform)
     )
@@ -3768,7 +4223,6 @@ def main() -> None:
     app = Application.builder().token(token).concurrent_updates(10).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("makesession", makesession_cmd))
     app.add_handler(CallbackQueryHandler(pornhub_quality_callback, pattern=r"^ph:"))
     app.add_handler(CallbackQueryHandler(youtube_quality_callback, pattern=r"^yt:"))
     app.add_handler(
