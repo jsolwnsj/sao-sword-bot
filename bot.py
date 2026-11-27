@@ -638,11 +638,23 @@ PORNHUB_COOKIES_FILE = Path(
 INSTAGRAM_COOKIES_FILE = Path(
     os.environ.get("INSTAGRAM_COOKIES_FILE", "/data/instagram_cookies.txt")
 )
+YOUTUBE_COOKIES_FILE = Path(
+    os.environ.get("YOUTUBE_COOKIES_FILE", "/data/youtube_cookies.txt")
+)
 
 # وب‌سرویس یوتیوب (GFw): دانلود یوتیوب دیگر با yt-dlp نیست و
 # کلید فقط از متغیر محیطی می‌آید — هیچ‌جا هاردکد نمی‌شود.
 GFWDEV_API_BASE = "https://api.gfwdev.ir/youtube"
 GFWDEV_API_KEY = os.environ.get("GFWDEV_API_KEY", "").strip()
+# کلید موزیک GFw (جستجو/استریم) جدا از کلید یوتیوب است:
+# مستندات برای هر سرویس «کلید لایسنس فعال <سرویس>» می‌خواهد
+# و لایسنس از منوی «وب‌سرویس‌ها» در @GFwAPIBOT برای همان
+# سرویس ساخته می‌شود؛ کلید یوتیوب روی /music/search با 401
+# (بدنه خالی) رد شد، پس اگر GFWDEV_MUSIC_API_KEY ست نشده
+# باشد همان کلید یوتیوب استفاده می‌شود (رفتار قبلی).
+GFWDEV_MUSIC_API_KEY = (
+    os.environ.get("GFWDEV_MUSIC_API_KEY", "").strip() or GFWDEV_API_KEY
+)
 _IMPERSONATION_WARNING_LOGGED = False
 
 
@@ -719,6 +731,47 @@ def get_instagram_cookiefile() -> str | None:
     try:
         if INSTAGRAM_COOKIES_FILE.is_file():
             return str(INSTAGRAM_COOKIES_FILE)
+    except OSError:
+        pass
+    return None
+
+
+def get_youtube_cookiefile() -> str | None:
+    """مسیر فایل کوکی یوتیوب؛ None اگر چیزی نباشد.
+    یوتیوب IP دیتاسنتر را بدون لاگین رد می‌کند («Sign in to
+    confirm you're not a bot»)؛ کوکی لاگین‌شده همان راه‌حلی
+    است که برای جستجوی یوتیوب در fallback اسپاتیفای استفاده
+    می‌شود. اولویت: متغیر YOUTUBE_COOKIES (مسیر فایل یا متن
+    خام فایل کوکی)، بعد فایل /data/youtube_cookies.txt روی
+    Volume ریل‌وی. کوکی فقط برای یوتیوب استفاده می‌شود."""
+    env_value = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if env_value:
+        if os.path.isfile(env_value):
+            return env_value
+        if "\n" in env_value and "youtube.com" in env_value:
+            try:
+                target = Path("/data/youtube_cookies.txt")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(env_value, encoding="utf-8")
+                return str(target)
+            except OSError:
+                try:
+                    fd, tmp = tempfile.mkstemp(
+                        prefix="yt-cookies-", suffix=".txt"
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(env_value)
+                    return tmp
+                except OSError:
+                    pass
+        logger.warning(
+            "YOUTUBE_COOKIES is set but is neither an existing file "
+            "nor cookie-file text; ignoring it."
+        )
+        return None
+    try:
+        if YOUTUBE_COOKIES_FILE.is_file():
+            return str(YOUTUBE_COOKIES_FILE)
     except OSError:
         pass
     return None
@@ -808,6 +861,15 @@ def _build_ydl_opts(url: str, height: int, outdir: str, tracker=None,
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
             logger.info("Using Instagram cookiefile: %s", cookiefile)
+
+    if platform == "youtube":
+        # یوتیوب با yt-dlp فقط در fallback اسپاتیفای استفاده
+        # می‌شود (دانلود مستقیم صدا وقتی کلید GFw نیست)؛ بدون
+        # کوکی لاگین‌شده IP دیتاسنتر رد می‌شود.
+        cookiefile = get_youtube_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+            logger.info("Using YouTube cookiefile: %s", cookiefile)
 
     return ydl_opts
 
@@ -3600,7 +3662,9 @@ def _gfw_pick_music_track(
 
 def _search_youtube_url_sync(query: str) -> str | None:
     """اولین نتیجه جستجوی یوتیوب برای «خواننده - آهنگ» با yt-dlp.
-    None اگر جستجو نشد (IP ریل‌وی یوتیوب را بلاک می‌کند)."""
+    None اگر جستجو نشد (IP ریل‌وی یوتیوب را بلاک می‌کند). اگر
+    کوکی لاگین‌شده یوتیوب باشد، به yt-dlp داده می‌شود — جستجو
+    با حساب لاگین‌شده معمولاً از بلاک IP رد می‌شود."""
     try:
         ydl_opts = {
             "quiet": True,
@@ -3613,6 +3677,10 @@ def _search_youtube_url_sync(query: str) -> str | None:
                 "Referer": "https://www.youtube.com/",
             },
         }
+        cookiefile = get_youtube_cookiefile()
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+            logger.info("Using YouTube cookiefile for search: %s", cookiefile)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=False)
     except Exception:
@@ -3692,8 +3760,10 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
     """دانلود اسپاتیفای — دقیقاً مثل ساندکلود: اول کاور آهنگ با
     اسم آهنگ و خواننده، بعد فایل صوتی mp3 با عنوان و خواننده درست.
     اگر لینک آلبوم/پلی‌لیست باشد، فقط اولین آهنگ گرفته می‌شود.
-    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error' | 'no_key'
-    | 'bad_key'
+    برمی‌گرداند: 'ok' | 'too_big' | 'empty' | 'error'
+    (خطای کلید یوتیوب اینجا برنمی‌گردد: اگر جستجوی موزیک
+    GFw خطا داد، به fallback یوتیوب می‌رویم و فقط وقتی همه
+    مسیرها نشد «error» برمی‌گردد.)
     پیام پیشرفت هر ۵ ثانیه روی پیام کاور ویرایش می‌شود؛ آخرش
     کپشن کاور به اسم آهنگ و خواننده برمی‌گردد و پیام کاور
     پاک نمی‌شود (مثل ساندکلود)."""
@@ -3799,14 +3869,21 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
             query = f"{artist} - {title}" if artist else title
 
             # ۴الف) جستجوی موزیک GFw (مسیر اصلی روی ریل‌وی)
-            if GFWDEV_API_KEY:
+            # اگر جستجوی موزیک خطا داد (مثلاً 401 چون کلید
+            # یوتیوب برای موزیک معتبر نیست)، زود برنمی‌گردیم —
+            # به ۴ب می‌رویم؛ فقط وقتی همه مسیرها نشد «error»
+            # برمی‌گردد (هرگز متن خطای کلید یوتیوب برای اسپاتیفای
+            # نشان داده نمی‌شود).
+            if GFWDEV_MUSIC_API_KEY:
                 tracks, gfw_err = await asyncio.to_thread(
-                    _gfw_music_search_sync, query, GFWDEV_API_KEY
+                    _gfw_music_search_sync, query, GFWDEV_MUSIC_API_KEY
                 )
-                if gfw_err == "no_key":
-                    return "no_key"
-                if gfw_err == "bad_key":
-                    return "bad_key"
+                if gfw_err:
+                    logger.warning(
+                        "GFw music search failed (%s); falling back "
+                        "to YouTube search", gfw_err
+                    )
+                    tracks = []
                 picked = _gfw_pick_music_track(tracks, title, artist)
                 if picked is not None:
                     stream_url = _gfw_music_track_stream_url(picked)
@@ -3816,7 +3893,7 @@ async def do_spotify_download(bot, chat_id: int, url: str) -> str:
                             stream_url = (
                                 f"{GFWDEV_MUSIC_STREAM_URL}/"
                                 f"{quote(tid, safe='')}"
-                                f"?api_key={quote(GFWDEV_API_KEY, safe='')}"
+                                f"?api_key={quote(GFWDEV_MUSIC_API_KEY, safe='')}"
                             )
                     if stream_url:
                         raw = subdir / "audio.bin"
